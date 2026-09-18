@@ -35,8 +35,7 @@ var (
 
 	keyBufPool = sync.Pool{
 		New: func() interface{} {
-			b := make([]byte, 520)
-			return &b
+			return new(make([]byte, 520))
 		},
 	}
 )
