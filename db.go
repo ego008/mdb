@@ -16,7 +16,7 @@ import (
 
 const (
 	scoreMin         uint64 = 0
-	scoreMax         uint64 = ^uint64(0)
+	scoreMax                = ^uint64(0)
 	uint64EncodedLen        = 8
 )
 
@@ -161,7 +161,7 @@ func (d *DB) HMSet(tx *bolt.Tx, name string, kvs ...[]byte) error {
 	return nil
 }
 
-func (d *DB) Hincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, error) {
+func (d *DB) HIncr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, error) {
 	b := tx.Bucket(bucketHash)
 	if b == nil {
 		return 0, ErrNilBucket
@@ -471,7 +471,7 @@ func (d *DB) ZMSet(tx *bolt.Tx, name string, kvs ...[]byte) error {
 	return nil
 }
 
-func (d *DB) Zincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, error) {
+func (d *DB) ZIncr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, error) {
 	b1 := tx.Bucket(bucketZetMember)
 	if b1 == nil {
 		return 0, ErrNilBucket

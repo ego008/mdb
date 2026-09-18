@@ -152,6 +152,8 @@ func TestDB_Hash_Operations(t *testing.T) {
 
 	err := db.Update(func(tx *bolt.Tx) error {
 		_ = db.HMSet(tx, "tick_data_a", kvs...) // 干扰项，测试前缀隔离
+		_ = db.HMSet(tx, "tick_dasa", kvs...)   // 干扰项
+		_ = db.HMSet(tx, "tick_daxa", kvs...)   // 干扰项
 		return db.HMSet(tx, hashName, kvs...)
 	})
 	if err != nil {
@@ -213,12 +215,12 @@ func TestDB_Hash_Operations(t *testing.T) {
 
 	// 5. Hash 自增与删除
 	_ = db.Update(func(tx *bolt.Tx) error {
-		v, _ := db.Hincr(tx, "stats", []byte("req_count"), 10)
+		v, _ := db.HIncr(tx, "stats", []byte("req_count"), 10)
 		if v != 10 {
 			t.Errorf("Hincr init failed: %d", v)
 		}
 		_ = db.HSet(tx, "stats", []byte("str_num"), []byte("100"))
-		v, _ = db.Hincr(tx, "stats", []byte("str_num"), 50)
+		v, _ = db.HIncr(tx, "stats", []byte("str_num"), 50)
 		if v != 150 {
 			t.Errorf("Hincr on string failed: %d", v)
 		}
@@ -255,7 +257,7 @@ func TestDB_Zet_Int_Operations(t *testing.T) {
 
 	_ = db.Update(func(tx *bolt.Tx) error {
 		_ = db.ZMSet(tx, zName, kvs...)
-		v, _ := db.Zincr(tx, zName, []byte("SZ000001"), -5) // 92 - 5 = 87
+		v, _ := db.ZIncr(tx, zName, []byte("SZ000001"), -5) // 92 - 5 = 87
 		if v != 87 {
 			t.Errorf("Zincr failed: %d", v)
 		}
