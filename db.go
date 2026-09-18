@@ -46,6 +46,16 @@ type (
 	DB struct {
 		db *bolt.DB
 		wg sync.WaitGroup
+		mu sync.RWMutex
+	}
+
+	// DBStats 存储数据库当前的状态信息
+	DBStats struct {
+		FilePath   string  `json:"file_path"`   // 磁盘文件路径
+		FileSize   int64   `json:"file_size"`   // 磁盘物理文件总大小 (Bytes)
+		DataSize   int64   `json:"data_size"`   // 有效 KV 数据总大小 (Bytes)
+		UsageRatio float64 `json:"usage_ratio"` // 空间有效利用率 (DataSize / FileSize)
+		FragRatio  float64 `json:"frag_ratio"`  // 磁盘碎片率 / 可压缩空间比例 (1 - UsageRatio)
 	}
 
 	Reply struct {
@@ -86,11 +96,16 @@ func OpenWithMode(path string, mode os.FileMode) (*DB, error) {
 
 // View executes a read-only transaction.
 func (d *DB) View(fn func(*bolt.Tx) error) error {
-	if d == nil || d.db == nil {
+	if d == nil {
 		return errors.New("nil database")
 	}
 	if fn == nil {
-		return errors.New("nil transaction callback")
+		return errors.New("nil function callback")
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.db == nil {
+		return errors.New("nil database")
 	}
 	d.wg.Add(1)
 	defer d.wg.Done()
@@ -99,11 +114,16 @@ func (d *DB) View(fn func(*bolt.Tx) error) error {
 
 // Update executes a read-write transaction.
 func (d *DB) Update(fn func(*bolt.Tx) error) error {
-	if d == nil || d.db == nil {
+	if d == nil {
 		return errors.New("nil database")
 	}
 	if fn == nil {
-		return errors.New("nil transaction callback")
+		return errors.New("nil function callback")
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.db == nil {
+		return errors.New("nil database")
 	}
 	d.wg.Add(1)
 	defer d.wg.Done()
@@ -111,8 +131,18 @@ func (d *DB) Update(fn func(*bolt.Tx) error) error {
 }
 
 func (d *DB) Close() error {
+	if d == nil {
+		return errors.New("nil database")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.db == nil {
+		return nil
+	}
 	d.wg.Wait()
-	return d.db.Close()
+	err := d.db.Close()
+	d.db = nil
+	return err
 }
 
 // -------------------
@@ -872,6 +902,172 @@ func (d *DB) ZDelBucket(tx *bolt.Tx, name string) error {
 	}
 
 	return nil
+}
+
+// -----------------------
+// 统计与压缩功能函数
+// -----------------------
+
+// Stats 获取当前数据库的状态信息，包括物理体积、有效数据字节数、空间利用率和碎片率。
+func (d *DB) Stats() (*DBStats, error) {
+	if d == nil {
+		return nil, errors.New("nil database")
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if d.db == nil {
+		return nil, errors.New("nil database")
+	}
+
+	path := d.db.Path()
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	fileSize := fi.Size()
+
+	var dataSize int64
+	d.wg.Add(1)
+	err = d.db.View(func(tx *bolt.Tx) error {
+		defer d.wg.Done()
+		return tx.ForEach(func(name []byte, b *bolt.Bucket) error {
+			return b.ForEach(func(k, v []byte) error {
+				dataSize += int64(len(k) + len(v))
+				return nil
+			})
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var usageRatio float64
+	if fileSize > 0 {
+		usageRatio = float64(dataSize) / float64(fileSize)
+	}
+	fragRatio := 1.0 - usageRatio
+	if fragRatio < 0 {
+		fragRatio = 0
+	}
+
+	return &DBStats{
+		FilePath:   path,
+		FileSize:   fileSize,
+		DataSize:   dataSize,
+		UsageRatio: usageRatio,
+		FragRatio:  fragRatio,
+	}, nil
+}
+
+// ShouldCompact 评估当前数据库是否需要执行压缩整理。
+// minFileSize: 触发压缩的最小物理文件字节数（避开数据量太小的情况，例如 4*1024*1024 即 4MB）。
+// minFragRatio: 触发压缩的最小碎片率/浪费率门槛（0.0~1.0，例如 0.20 代表碎片率达到 20% 才进行压缩）。
+func (d *DB) ShouldCompact(minFileSize int64, minFragRatio float64) (bool, *DBStats, error) {
+	stats, err := d.Stats()
+	if err != nil {
+		return false, nil, err
+	}
+
+	// 1. 物理文件过小，压缩收益极微，不建议压缩
+	if stats.FileSize < minFileSize {
+		return false, stats, nil
+	}
+
+	// 2. 碎片率没有达到门槛，空间浪费不大，不建议压缩
+	if stats.FragRatio < minFragRatio {
+		return false, stats, nil
+	}
+
+	return true, stats, nil
+}
+
+// Compact 执行数据库压缩整理。
+// 如果 dstPath 为空或等于当前 DB 路径，则进行安全的原地产生/替换 (In-Place Compact)；
+// 如果 dstPath 为新路径，则将压缩后的新数据库另存为该文件。
+func (d *DB) Compact(dstPath string) error {
+	if d == nil {
+		return errors.New("nil database")
+	}
+
+	d.mu.RLock()
+	if d.db == nil {
+		d.mu.RUnlock()
+		return errors.New("nil database")
+	}
+	origPath := d.db.Path()
+	d.mu.RUnlock()
+
+	isInPlace := dstPath == "" || dstPath == origPath
+	targetPath := dstPath
+	if isInPlace {
+		targetPath = origPath + ".compact.tmp"
+	}
+
+	// 1. 拷贝整理全量数据至目标临时/新文件
+	d.mu.RLock()
+	err := compactDB(d.db, targetPath, 0o600)
+	d.mu.RUnlock()
+	if err != nil {
+		if isInPlace {
+			_ = os.Remove(targetPath)
+		}
+		return err
+	}
+
+	// 2. 如果仅为导出另存为新文件，直接结束
+	if !isInPlace {
+		return nil
+	}
+
+	// 3. 原地替换：获取写锁，安全等待活跃事务完成并替换 DB 句柄
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// 等待所有已有读写事务处理完
+	d.wg.Wait()
+
+	if err := d.db.Close(); err != nil {
+		_ = os.Remove(targetPath)
+		return fmt.Errorf("failed to close old db for compaction: %w", err)
+	}
+
+	if err := os.Rename(targetPath, origPath); err != nil {
+		_ = os.Remove(targetPath)
+		return fmt.Errorf("failed to replace db file: %w", err)
+	}
+
+	newDB, err := bolt.Open(origPath, 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		return fmt.Errorf("failed to reopen db after compaction: %w", err)
+	}
+	d.db = newDB
+
+	return nil
+}
+
+// compactDB 内部辅助函数：逐桶/逐条记录顺序写入目标文件，生成填充率最高、零碎片的数据库
+func compactDB(srcDB *bolt.DB, dstPath string, mode os.FileMode) error {
+	dstDB, err := bolt.Open(dstPath, mode, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return err
+	}
+	defer dstDB.Close()
+
+	return srcDB.View(func(srcTx *bolt.Tx) error {
+		return dstDB.Update(func(dstTx *bolt.Tx) error {
+			return srcTx.ForEach(func(name []byte, b *bolt.Bucket) error {
+				dstBucket, err := dstTx.CreateBucketIfNotExists(name)
+				if err != nil {
+					return err
+				}
+				return b.ForEach(func(k, v []byte) error {
+					return dstBucket.Put(k, v)
+				})
+			})
+		})
+	})
 }
 
 // -----------

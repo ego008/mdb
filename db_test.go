@@ -3,6 +3,7 @@ package mdb
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1118,5 +1119,96 @@ func TestDB_ZDel_ZMDel_ZDelBucket(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("ZDelBucket test failed: %v", err)
+	}
+}
+
+func TestDB_Stats_ShouldCompact_Compact(t *testing.T) {
+	db := helperOpenDB(t)
+
+	hashName := "compact_test_hash"
+	val1KB := bytes.Repeat([]byte("x"), 1024)
+
+	// 1. 批量写入 3000 条数据 (约 3MB+ 数据量)
+	err := db.Update(func(tx *bbolt.Tx) error {
+		for i := 0; i < 3000; i++ {
+			k := []byte(fmt.Sprintf("key_%04d", i))
+			if err := db.HSet(tx, hashName, k, val1KB); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("setup insert failed: %v", err)
+	}
+
+	// 2. 删除 80% (2400 条) 的数据，产生大量磁盘空闲页/碎片
+	err = db.Update(func(tx *bbolt.Tx) error {
+		var delKeys [][]byte
+		for i := 0; i < 2400; i++ {
+			delKeys = append(delKeys, []byte(fmt.Sprintf("key_%04d", i)))
+		}
+		return db.HMDel(tx, hashName, delKeys)
+	})
+	if err != nil {
+		t.Fatalf("HMDel failed: %v", err)
+	}
+
+	// 3. 检查删除后的状态
+	statsAfterDel, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats failed: %v", err)
+	}
+	t.Logf("After Delete: FileSize=%d, DataSize=%d, FragRatio=%.2f%%",
+		statsAfterDel.FileSize, statsAfterDel.DataSize, statsAfterDel.FragRatio*100)
+
+	// 4. 门槛测试：设置 500KB 文件下限，20% 碎片率下限 -> 应返回 true
+	shouldCompact, _, err := db.ShouldCompact(500*1024, 0.20)
+	if err != nil {
+		t.Fatalf("ShouldCompact failed: %v", err)
+	}
+	if !shouldCompact {
+		t.Errorf("ShouldCompact expected true, got false")
+	}
+
+	// 门槛测试：设置 100MB 文件下限（数据量不足） -> 应返回 false
+	shouldCompactHigh, _, _ := db.ShouldCompact(100*1024*1024, 0.20)
+	if shouldCompactHigh {
+		t.Errorf("ShouldCompact for high minFileSize expected false, got true")
+	}
+
+	// 5. 执行原地压缩整理 (In-Place Compact)
+	if err := db.Compact(""); err != nil {
+		t.Fatalf("Compact failed: %v", err)
+	}
+
+	// 6. 验证压缩后的物理文件体积大幅减小
+	statsAfterCompact, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats after compact failed: %v", err)
+	}
+	t.Logf("After Compact: FileSize=%d, DataSize=%d, FragRatio=%.2f%%",
+		statsAfterCompact.FileSize, statsAfterCompact.DataSize, statsAfterCompact.FragRatio*100)
+
+	if statsAfterCompact.FileSize >= statsAfterDel.FileSize {
+		t.Errorf("FileSize did not decrease after compact: before=%d, after=%d",
+			statsAfterDel.FileSize, statsAfterCompact.FileSize)
+	}
+
+	// 7. 验证数据完整性 (剩余 600 条数据必须保持完全一致)
+	err = db.View(func(tx *bbolt.Tx) error {
+		r := db.HScan(tx, hashName, nil, 1000)
+		if !r.OK() || r.KvLen() != 600 {
+			t.Fatalf("Data integrity check failed: got len=%d, want 600", r.KvLen())
+		}
+
+		rGet := db.HGet(tx, hashName, []byte("key_2999"))
+		if !rGet.OK() || len(rGet.Bytes()) != 1024 {
+			t.Errorf("Data key_2999 corrupted or not found")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("View failed: %v", err)
 	}
 }
