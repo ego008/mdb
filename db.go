@@ -63,7 +63,10 @@ func OpenWithMode(path string, mode os.FileMode) (*DB, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("empty database path")
 	}
-	database, err := bolt.Open(path, mode, &bolt.Options{Timeout: time.Second})
+	database, err := bolt.Open(path, mode, &bolt.Options{
+		Timeout:      time.Second,
+		FreelistType: bolt.FreelistMapType,
+	})
 	if err != nil {
 		return nil, err
 	}
