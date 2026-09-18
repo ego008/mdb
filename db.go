@@ -380,6 +380,70 @@ func (d *DB) HRScan(tx *bolt.Tx, name string, keyStart []byte, limit int) *Reply
 	return r
 }
 
+// HDel 删除 Hash 中的单个 key。
+func (d *DB) HDel(tx *bolt.Tx, name string, key []byte) error {
+	b := tx.Bucket(bucketHash)
+	if b == nil {
+		return ErrNilBucket
+	}
+
+	reallyKey, err := EncodeHashKey(name, key)
+	if err != nil {
+		return err
+	}
+
+	return b.Delete(reallyKey)
+}
+
+// HMDel 批量删除 Hash 中的多个 key。
+func (d *DB) HMDel(tx *bolt.Tx, name string, keys [][]byte) error {
+	b := tx.Bucket(bucketHash)
+	if b == nil {
+		return ErrNilBucket
+	}
+
+	for _, key := range keys {
+		reallyKey, err := EncodeHashKey(name, key)
+		if err != nil {
+			return err
+		}
+		if err := b.Delete(reallyKey); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// HDelBucket 清空指定 name 的整个 Hash 表中的所有数据。
+func (d *DB) HDelBucket(tx *bolt.Tx, name string) error {
+	b := tx.Bucket(bucketHash)
+	if b == nil {
+		return ErrNilBucket
+	}
+
+	prefix, err := EncodeHashKey(name, nil)
+	if err != nil {
+		return err
+	}
+
+	c := b.Cursor()
+	var keysToDelete [][]byte
+	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+		kCopy := make([]byte, len(k))
+		copy(kCopy, k)
+		keysToDelete = append(keysToDelete, kCopy)
+	}
+
+	for _, k := range keysToDelete {
+		if err := b.Delete(k); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // -------------------
 // Zet 功能函数
 // -------------------
@@ -711,6 +775,103 @@ func (d *DB) ZRScan(tx *bolt.Tx, name string, keyStart []byte, scoreStart, score
 
 	r.State = replyOK
 	return r
+}
+
+// -------------------
+// Zet 删除函数
+// -------------------
+
+// ZDel 删除 Zet 中的单个 member（同时清理 member 映射与 score 排序索引）。
+func (d *DB) ZDel(tx *bolt.Tx, name string, key []byte) error {
+	b1 := tx.Bucket(bucketZetMember)
+	b2 := tx.Bucket(bucketZetScore)
+	if b1 == nil || b2 == nil {
+		return ErrNilBucket
+	}
+
+	reallyKey, err := EncodeHashKey(name, key)
+	if err != nil {
+		return err
+	}
+
+	oldScoreByte := b1.Get(reallyKey)
+	if oldScoreByte == nil {
+		return nil // key 不存在，直接返回
+	}
+
+	// 1. 从 Member 桶中删除
+	if err := b1.Delete(reallyKey); err != nil {
+		return err
+	}
+
+	// 2. 解析旧 score 并从 Score 索引桶中删除
+	var oldScore uint64
+	if len(oldScoreByte) == uint64EncodedLen {
+		oldScore = B2i(oldScoreByte)
+	} else if len(oldScoreByte) > 0 {
+		oldScore = DS2i(B2s(oldScoreByte))
+	}
+
+	reallyScoreKey, err := EncodeZsetScoreKey(name, key, oldScore)
+	if err != nil {
+		return err
+	}
+
+	return b2.Delete(reallyScoreKey)
+}
+
+// ZMDel 批量删除 Zet 中的多个 member。
+func (d *DB) ZMDel(tx *bolt.Tx, name string, keys [][]byte) error {
+	for _, key := range keys {
+		if err := d.ZDel(tx, name, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ZDelBucket 清空指定 name 的整个 Zet 中的所有成员及排序索引。
+func (d *DB) ZDelBucket(tx *bolt.Tx, name string) error {
+	b1 := tx.Bucket(bucketZetMember)
+	b2 := tx.Bucket(bucketZetScore)
+	if b1 == nil || b2 == nil {
+		return ErrNilBucket
+	}
+
+	prefix, err := EncodeHashKey(name, nil)
+	if err != nil {
+		return err
+	}
+
+	// 1. 清理 bucketZetMember
+	c1 := b1.Cursor()
+	var keysToDelete1 [][]byte
+	for k, _ := c1.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c1.Next() {
+		kCopy := make([]byte, len(k))
+		copy(kCopy, k)
+		keysToDelete1 = append(keysToDelete1, kCopy)
+	}
+	for _, k := range keysToDelete1 {
+		if err := b1.Delete(k); err != nil {
+			return err
+		}
+	}
+
+	// 2. 清理 bucketZetScore
+	c2 := b2.Cursor()
+	var keysToDelete2 [][]byte
+	for k, _ := c2.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c2.Next() {
+		kCopy := make([]byte, len(k))
+		copy(kCopy, k)
+		keysToDelete2 = append(keysToDelete2, kCopy)
+	}
+	for _, k := range keysToDelete2 {
+		if err := b2.Delete(k); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // -----------

@@ -951,3 +951,172 @@ func TestDB_HMGet_ZMGet(t *testing.T) {
 		}
 	})
 }
+
+func TestDB_HDel_HMDel_HDelBucket(t *testing.T) {
+	db := helperOpenDB(t)
+
+	hashName := "user_info"
+	hashNeighbor := "user_info_other"
+
+	kvs := [][]byte{
+		[]byte("k1"), []byte("v1"),
+		[]byte("k2"), []byte("v2"),
+		[]byte("k3"), []byte("v3"),
+		[]byte("k4"), []byte("v4"),
+	}
+
+	err := db.Update(func(tx *bbolt.Tx) error {
+		_ = db.HMSet(tx, hashNeighbor, kvs...)
+		return db.HMSet(tx, hashName, kvs...)
+	})
+	if err != nil {
+		t.Fatalf("HMSet setup failed: %v", err)
+	}
+
+	// 1. 测试 HDel 单个删除
+	err = db.Update(func(tx *bbolt.Tx) error {
+		if err := db.HDel(tx, hashName, []byte("k1")); err != nil {
+			return err
+		}
+		r := db.HGet(tx, hashName, []byte("k1"))
+		if r.OK() {
+			t.Errorf("expected k1 to be deleted, but still found")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HDel test failed: %v", err)
+	}
+
+	// 2. 测试 HMDel 批量删除
+	err = db.Update(func(tx *bbolt.Tx) error {
+		delKeys := [][]byte{[]byte("k2"), []byte("k3")}
+		if err := db.HMDel(tx, hashName, delKeys); err != nil {
+			return err
+		}
+
+		r := db.HMGet(tx, hashName, delKeys)
+		if r.Data[1] != nil || r.Data[3] != nil {
+			t.Errorf("HMDel failed: k2 or k3 still exists")
+		}
+
+		// 验证未被删除的 k4 依然正常
+		rK4 := db.HGet(tx, hashName, []byte("k4"))
+		if !rK4.OK() || !bytes.Equal(rK4.Bytes(), []byte("v4")) {
+			t.Errorf("HMDel accidentally deleted k4")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HMDel test failed: %v", err)
+	}
+
+	// 3. 测试 HDelBucket 清空整个 Hash 表
+	err = db.Update(func(tx *bbolt.Tx) error {
+		if err := db.HDelBucket(tx, hashName); err != nil {
+			return err
+		}
+
+		// 验证目标 Hash 表已空
+		r := db.HScan(tx, hashName, nil, 100)
+		if r.KvLen() != 0 {
+			t.Errorf("HDelBucket failed: target hash still has %d items", r.KvLen())
+		}
+
+		// 验证相邻 Hash 表未受干扰
+		rNeighbor := db.HScan(tx, hashNeighbor, nil, 100)
+		if rNeighbor.KvLen() != 4 {
+			t.Errorf("HDelBucket affected neighbor hash: got len=%d, want 4", rNeighbor.KvLen())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HDelBucket test failed: %v", err)
+	}
+}
+
+func TestDB_ZDel_ZMDel_ZDelBucket(t *testing.T) {
+	db := helperOpenDB(t)
+
+	zName := "game_rank"
+	zNeighbor := "game_rank_other"
+
+	kvs := [][]byte{
+		[]byte("p1"), I2b(100),
+		[]byte("p2"), I2b(200),
+		[]byte("p3"), I2b(300),
+		[]byte("p4"), I2b(400),
+	}
+
+	err := db.Update(func(tx *bbolt.Tx) error {
+		_ = db.ZMSet(tx, zNeighbor, kvs...)
+		return db.ZMSet(tx, zName, kvs...)
+	})
+	if err != nil {
+		t.Fatalf("ZMSet setup failed: %v", err)
+	}
+
+	// 1. 测试 ZDel 单个删除（同时验证 Member 和 Score 桶索引清理）
+	err = db.Update(func(tx *bbolt.Tx) error {
+		if err := db.ZDel(tx, zName, []byte("p1")); err != nil {
+			return err
+		}
+
+		rGet := db.ZGet(tx, zName, []byte("p1"))
+		if rGet.OK() {
+			t.Errorf("ZDel failed: p1 still exists in Member bucket")
+		}
+
+		rScan := db.ZScan(tx, zName, nil, 0, 0, 100)
+		if rScan.KvLen() != 3 {
+			t.Errorf("ZDel failed: ZScan length mismatch, got %d, want 3", rScan.KvLen())
+		}
+		if rScan.Data[0].String() == "p1" {
+			t.Errorf("ZDel failed: p1 still exists in Score index bucket")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ZDel test failed: %v", err)
+	}
+
+	// 2. 测试 ZMDel 批量删除
+	err = db.Update(func(tx *bbolt.Tx) error {
+		delKeys := [][]byte{[]byte("p2"), []byte("p3")}
+		if err := db.ZMDel(tx, zName, delKeys); err != nil {
+			return err
+		}
+
+		rScan := db.ZScan(tx, zName, nil, 0, 0, 100)
+		if rScan.KvLen() != 1 || rScan.Data[0].String() != "p4" {
+			t.Errorf("ZMDel failed: expected only p4 left, got %v", rScan.Dict())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ZMDel test failed: %v", err)
+	}
+
+	// 3. 测试 ZDelBucket 清空整个 Zet 表
+	err = db.Update(func(tx *bbolt.Tx) error {
+		if err := db.ZDelBucket(tx, zName); err != nil {
+			return err
+		}
+
+		// 验证目标 ZSet 已空
+		rScan := db.ZScan(tx, zName, nil, 0, 0, 100)
+		if rScan.KvLen() != 0 {
+			t.Errorf("ZDelBucket failed: target ZSet still has %d items", rScan.KvLen())
+		}
+
+		// 验证相邻 ZSet 未受干扰
+		rNeighbor := db.ZScan(tx, zNeighbor, nil, 0, 0, 100)
+		if rNeighbor.KvLen() != 4 {
+			t.Errorf("ZDelBucket affected neighbor ZSet: got len=%d, want 4", rNeighbor.KvLen())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ZDelBucket test failed: %v", err)
+	}
+}
