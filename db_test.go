@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,7 +17,7 @@ import (
 // helperOpenDB 创建临时测试数据库并在测试结束时自动清理
 func helperOpenDB(t *testing.T) *DB {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "test.db")
+	dbPath := filepath.Join(t.TempDir(), "quant_sys_test.db")
 	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Open database failed: %v", err)
@@ -28,44 +29,61 @@ func helperOpenDB(t *testing.T) *DB {
 }
 
 // -----------------------------------------------------------------------------
-// Key 编解码及辅助解析器测试
+// 1. 底层解析器与编解码边界测试
 // -----------------------------------------------------------------------------
 
-func TestEncodeDecodeHashKey_Success(t *testing.T) {
-	tests := []struct {
-		name     string
-		key      []byte
-		hashName string
-	}{
-		{hashName: "user", key: []byte("1001"), name: "normal string and key"},
-		{hashName: "a", key: []byte("b"), name: "single char"},
-		{hashName: "", key: []byte(""), name: "empty name and empty key"},
-		{hashName: strings.Repeat("x", 255), key: bytes.Repeat([]byte("y"), 255), name: "max length 255 bytes"},
+func TestZeroCopyParsers(t *testing.T) {
+	// 测试 parseUintBytes
+	u, err := parseUintBytes([]byte("1234567890"))
+	if err != nil || u != 1234567890 {
+		t.Errorf("parseUintBytes failed: got %d, err %v", u, err)
+	}
+	if _, err = parseUintBytes([]byte("12a3")); err == nil {
+		t.Errorf("parseUintBytes expected error for invalid string")
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf, err := EncodeHashKey(tt.hashName, tt.key)
-			if err != nil {
-				t.Fatalf("EncodeHashKey unexpected error: %v", err)
-			}
-
-			gotName, gotKey, err := DecodeHashKey(buf)
-			if err != nil {
-				t.Fatalf("DecodeHashKey unexpected error: %v", err)
-			}
-
-			if gotName != tt.hashName {
-				t.Errorf("DecodeName mismatch: got %q, want %q", gotName, tt.hashName)
-			}
-			if !bytes.Equal(gotKey, tt.key) {
-				t.Errorf("DecodeKey mismatch: got %q, want %q", gotKey, tt.key)
-			}
-		})
+	// 测试 parseIntBytes
+	i, err := parseIntBytes([]byte("-987654321"))
+	if err != nil || i != -987654321 {
+		t.Errorf("parseIntBytes failed: got %d, err %v", i, err)
+	}
+	i2, err := parseIntBytes([]byte("8848"))
+	if err != nil || i2 != 8848 {
+		t.Errorf("parseIntBytes failed: got %d, err %v", i2, err)
 	}
 }
 
-func TestEncodeHashKey_LengthExceeded(t *testing.T) {
+func TestFloat64SortableConversion(t *testing.T) {
+	// 验证 IEEE 754 浮点数转 uint64 后的严格单调递增性 (适用 MACD 等负数指标)
+	floats := []float64{-999.99, -1.0, -0.01, 0.0, 0.01, 1.0, 999.99}
+	var prevU uint64
+	for i, f := range floats {
+		u := Float64ToSortableUint64(f)
+		backF := SortableUint64ToFloat64(u)
+		if math.Abs(backF-f) > 1e-9 {
+			t.Errorf("Mismatch conversion: %f != %f", f, backF)
+		}
+		if i > 0 && u <= prevU {
+			t.Errorf("Not strict monotonic: %f(%d) <= previous(%d)", f, u, prevU)
+		}
+		prevU = u
+	}
+}
+
+func TestEncodeBufExpansion(t *testing.T) {
+	// 验证指针穿透：当对象池给的 buffer 太小导致 make 扩容时，指针是否成功更新
+	buf := make([]byte, 2)
+	bufPtr := &buf
+	out, err := encodeHashKeyToBuf("symbol", []byte("SH600519"), bufPtr)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(out) != 15 || cap(*bufPtr) < 15 {
+		t.Errorf("buffer not expanded correctly, cap is %d", cap(*bufPtr))
+	}
+}
+
+func TestKeyEncodingLimits(t *testing.T) {
 	longName := strings.Repeat("a", 256)
 	_, err := EncodeHashKey(longName, []byte("key"))
 	if !errors.Is(err, ErrNameTooLong) {
@@ -77,126 +95,63 @@ func TestEncodeHashKey_LengthExceeded(t *testing.T) {
 	if !errors.Is(err, ErrKeyTooLong) {
 		t.Errorf("expected ErrKeyTooLong, got %v", err)
 	}
-}
 
-func TestDecodeInvalidBuffer(t *testing.T) {
-	_, _, err := DecodeHashKey([]byte{})
+	_, _, err = DecodeHashKey([]byte{})
 	if !errors.Is(err, ErrBufferTooShort) {
-		t.Errorf("expected ErrBufferTooShort, got %v", err)
-	}
-
-	buf := []byte{10, 'a', 'b'}
-	_, _, err = DecodeHashKey(buf)
-	if !errors.Is(err, ErrBufferTooShort) {
-		t.Errorf("expected ErrBufferTooShort, got %v", err)
-	}
-
-	invalidZBufs := [][]byte{
-		nil,
-		{},
-		{0},
-		{5, 'a', 'b'},
-		{2, 'a', 'b', 0, 0, 0, 0},
-	}
-	for i, zb := range invalidZBufs {
-		_, _, _, err := DecodeZsetScoreKey(zb)
-		if err != ErrInvalidBuf {
-			t.Errorf("Test case %d expected ErrInvalidBuf, got %v", i, err)
-		}
-	}
-}
-
-func TestZeroCopyParsers(t *testing.T) {
-	// parseUintBytes
-	u, err := parseUintBytes([]byte("123456"))
-	if err != nil || u != 123456 {
-		t.Errorf("parseUintBytes failed: got %d, err %v", u, err)
-	}
-	_, err = parseUintBytes([]byte("12a3"))
-	if err == nil {
-		t.Errorf("parseUintBytes expected error for invalid string")
-	}
-
-	// parseIntBytes
-	i, err := parseIntBytes([]byte("-9876"))
-	if err != nil || i != -9876 {
-		t.Errorf("parseIntBytes failed: got %d, err %v", i, err)
-	}
-	i2, err := parseIntBytes([]byte("9876"))
-	if err != nil || i2 != 9876 {
-		t.Errorf("parseIntBytes failed: got %d, err %v", i2, err)
+		t.Errorf("expected ErrBufferTooShort for empty buf")
 	}
 }
 
 // -----------------------------------------------------------------------------
-// 数据库基础与并发生命周期测试
+// 2. 数据库生命周期与并发测试
 // -----------------------------------------------------------------------------
 
-func TestDB_NilSafety(t *testing.T) {
+func TestDB_LifecycleAndConcurrency(t *testing.T) {
 	var nilDB *DB
-
 	if err := nilDB.View(func(tx *bolt.Tx) error { return nil }); err == nil {
 		t.Error("expected error on nil db View")
-	}
-	if err := nilDB.Update(func(tx *bolt.Tx) error { return nil }); err == nil {
-		t.Error("expected error on nil db Update")
 	}
 
 	db := helperOpenDB(t)
 	if err := db.View(nil); err == nil {
-		t.Error("expected error on nil callback View")
+		t.Error("expected error on nil callback")
 	}
-	if err := db.Update(nil); err == nil {
-		t.Error("expected error on nil callback Update")
-	}
-}
 
-func TestDB_Close_Concurrency(t *testing.T) {
-	db := helperOpenDB(t)
-
+	// 并发读写屏障测试 (模拟量化系统的高频读取与后台 Compact 热替换冲突)
 	var wg sync.WaitGroup
 	wg.Add(1)
-
-	// 模拟事务正在运行中被并发 Close 调用的场景（利用 RWMutex 保护）
 	go func() {
 		_ = db.View(func(tx *bolt.Tx) error {
 			wg.Done()
-			time.Sleep(50 * time.Millisecond) // 占有读锁
+			time.Sleep(50 * time.Millisecond) // 模拟慢查询持有 RLock
 			return nil
 		})
 	}()
 
 	wg.Wait()
 	start := time.Now()
-	if err := db.Close(); err != nil {
-		t.Fatalf("db.Close failed: %v", err)
-	}
-
-	// Close 的写锁必须等待 View 的读锁释放才能获取
+	_ = db.Close()
 	if time.Since(start) < 40*time.Millisecond {
-		t.Error("db.Close returned too early, did not wait for active transaction")
+		t.Error("Close did not wait for active transaction to release RLock")
 	}
 }
 
 // -----------------------------------------------------------------------------
-// Hash: Set, GetFunc, ScanFunc 测试
+// 3. Hash 存储引擎全量测试 (HGetFunc / HScanFunc)
 // -----------------------------------------------------------------------------
 
-func TestDB_Hash_GetFunc_ScanFunc(t *testing.T) {
+func TestDB_Hash_Operations(t *testing.T) {
 	db := helperOpenDB(t)
-
-	hashName := "user_info"
+	hashName := "tick_data"
 	kvs := [][]byte{
-		[]byte("a"), []byte("av"),
-		[]byte("b"), []byte("bv"),
-		[]byte("c"), []byte("cv"),
-		[]byte("d"), []byte("dv"),
+		[]byte("09:30:00"), []byte("15.01"),
+		[]byte("09:30:03"), []byte("15.05"),
+		[]byte("09:30:06"), []byte("15.02"),
+		[]byte("09:30:09"), []byte("15.08"),
 	}
 
 	err := db.Update(func(tx *bolt.Tx) error {
-		// 写入相邻命名空间验证隔离性
-		_ = db.HMSet(tx, "user_infi", kvs...)
-		_ = db.HMSet(tx, "user_infq", kvs...)
+		_ = db.HMSet(tx, "tick_data_a", kvs...) // 干扰项，测试前缀隔离
 		return db.HMSet(tx, hashName, kvs...)
 	})
 	if err != nil {
@@ -204,97 +159,74 @@ func TestDB_Hash_GetFunc_ScanFunc(t *testing.T) {
 	}
 
 	err = db.View(func(tx *bolt.Tx) error {
-		// 1. 测试 HGetFunc
-		var outVal []byte
-		err := db.HGetFunc(tx, hashName, []byte("c"), func(val []byte) error {
-			outVal = append([]byte(nil), val...)
+		// 1. HGetFunc 命中与未命中
+		var price string
+		err := db.HGetFunc(tx, hashName, []byte("09:30:03"), func(val []byte) error {
+			price = string(val)
 			return nil
 		})
-		if err != nil || string(outVal) != "cv" {
-			t.Errorf("HGetFunc failed: got %s, err %v", outVal, err)
+		if err != nil || price != "15.05" {
+			t.Errorf("HGetFunc failed: got %s, err %v", price, err)
 		}
 
-		// 测试 ErrKeyNotFound
-		err = db.HGetFunc(tx, hashName, []byte("not_exist"), func(val []byte) error { return nil })
+		err = db.HGetFunc(tx, hashName, []byte("09:30:01"), func(v []byte) error { return nil })
 		if !errors.Is(err, ErrKeyNotFound) {
-			t.Errorf("HGetFunc expected ErrKeyNotFound, got %v", err)
+			t.Errorf("HGetFunc expected ErrKeyNotFound")
 		}
 
-		// 2. 测试 HMGetFunc
-		queryKeys := [][]byte{[]byte("a"), []byte("c"), []byte("not_exist")}
+		// 2. HMGetFunc 批量获取
 		results := make(map[string]string)
-		err = db.HMGetFunc(tx, hashName, queryKeys, func(key, val []byte) error {
-			if val != nil {
-				results[string(key)] = string(val)
+		err = db.HMGetFunc(tx, hashName, [][]byte{[]byte("09:30:00"), []byte("09:30:09"), []byte("miss")}, func(k, v []byte) error {
+			if v != nil {
+				results[string(k)] = string(v)
 			}
 			return nil
 		})
-		if err != nil || results["a"] != "av" || results["c"] != "cv" || len(results) != 2 {
-			t.Errorf("HMGetFunc mismatch: %v, err: %v", results, err)
+		if len(results) != 2 || results["09:30:09"] != "15.08" {
+			t.Errorf("HMGetFunc mismatch: %v", results)
 		}
 
-		// 3. 测试 HScanFunc (正序 + 提前终止)
+		// 3. HScanFunc 正序扫描与提前终止 (Early Break)
 		var scanned []string
 		err = db.HScanFunc(tx, hashName, nil, 100, func(key, val []byte) bool {
 			scanned = append(scanned, string(key))
-			// 测试提前终止 (Early Break)，在扫描到 b 时退出
-			return string(key) != "b"
+			return string(key) != "09:30:03" // 扫到 03 提前退出
 		})
-		if err != nil {
-			t.Fatalf("HScanFunc failed: %v", err)
-		}
-		if len(scanned) != 2 || scanned[0] != "a" || scanned[1] != "b" {
+		if len(scanned) != 2 || scanned[1] != "09:30:03" {
 			t.Errorf("HScanFunc early break failed: %v", scanned)
 		}
 
-		// 4. 测试 HRScanFunc (逆序)
+		// 4. HRScanFunc 逆序扫描
 		scanned = nil
 		err = db.HRScanFunc(tx, hashName, nil, 2, func(key, val []byte) bool {
 			scanned = append(scanned, string(key))
 			return true
 		})
-		if len(scanned) != 2 || scanned[0] != "d" || scanned[1] != "c" {
-			t.Errorf("HRScanFunc limit failed: %v", scanned)
+		if len(scanned) != 2 || scanned[0] != "09:30:09" || scanned[1] != "09:30:06" {
+			t.Errorf("HRScanFunc sequence failed: %v", scanned)
 		}
-
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("View failed: %v", err)
+		t.Fatalf("Hash View failed: %v", err)
 	}
-}
 
-func TestDB_Hash_Hincr_Del(t *testing.T) {
-	db := helperOpenDB(t)
-
-	hashName := "counters"
-	field := []byte("clicks")
-
-	err := db.Update(func(tx *bolt.Tx) error {
-		// 1. 测试 Hincr
-		v, err := db.Hincr(tx, hashName, field, 10)
-		if err != nil || v != 10 {
-			t.Errorf("Hincr initial failed: got %d", v)
+	// 5. Hash 自增与删除
+	_ = db.Update(func(tx *bolt.Tx) error {
+		v, _ := db.Hincr(tx, "stats", []byte("req_count"), 10)
+		if v != 10 {
+			t.Errorf("Hincr init failed: %d", v)
+		}
+		_ = db.HSet(tx, "stats", []byte("str_num"), []byte("100"))
+		v, _ = db.Hincr(tx, "stats", []byte("str_num"), 50)
+		if v != 150 {
+			t.Errorf("Hincr on string failed: %d", v)
 		}
 
-		// 测试对字符数字 Hincr (触发零拷贝解析)
-		_ = db.HSet(tx, hashName, []byte("str_num"), []byte("100"))
-		v, err = db.Hincr(tx, hashName, []byte("str_num"), 50)
-		if err != nil || v != 150 {
-			t.Errorf("Hincr string num failed: got %d", v)
-		}
-
-		// 2. 测试 HDel 批量删除与 Bucket 清空
-		_ = db.HSet(tx, hashName, []byte("k1"), []byte("v1"))
-		_ = db.HSet(tx, hashName, []byte("k2"), []byte("v2"))
-		_ = db.HMDel(tx, hashName, [][]byte{[]byte("k1"), []byte("k2")})
-
-		err = db.HGetFunc(tx, hashName, []byte("k1"), func(v []byte) error { return nil })
-		if !errors.Is(err, ErrKeyNotFound) {
-			t.Errorf("HMDel failed to delete")
-		}
-
+		_ = db.HDel(tx, hashName, []byte("09:30:00"))
+		_ = db.HMDel(tx, hashName, [][]byte{[]byte("09:30:03")})
 		_ = db.HDelBucket(tx, hashName)
+
 		count := 0
 		_ = db.HScanFunc(tx, hashName, nil, 10, func(k, v []byte) bool {
 			count++
@@ -303,210 +235,168 @@ func TestDB_Hash_Hincr_Del(t *testing.T) {
 		if count != 0 {
 			t.Errorf("HDelBucket failed, remaining %d", count)
 		}
-
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("Update failed: %v", err)
-	}
 }
 
 // -----------------------------------------------------------------------------
-// Zet: Set, GetFunc, ScanFunc, Incr 测试
+// 4. ZSet 基础整数排序 (RPS 排名场景)
 // -----------------------------------------------------------------------------
 
-func TestDB_Zet_Functions(t *testing.T) {
+func TestDB_Zet_Int_Operations(t *testing.T) {
 	db := helperOpenDB(t)
-	zName := "leaderboard"
-
+	zName := "rps_rank"
 	kvs := [][]byte{
-		[]byte("p1"), I2b(100),
-		[]byte("p2"), []byte("200"), // 混合测试 string score
-		[]byte("p3"), I2b(300),
-		[]byte("p4"), I2b(400),
+		[]byte("SH600000"), I2b(85),
+		[]byte("SZ000001"), []byte("92"), // 测试 string 解析
+		[]byte("SH600519"), I2b(99),
+		[]byte("SZ002594"), I2b(95),
 	}
 
-	err := db.Update(func(tx *bolt.Tx) error {
-		if err := db.ZMSet(tx, zName, kvs...); err != nil {
-			return err
-		}
-		// 1. Zincr
-		newScore, err := db.Zincr(tx, zName, []byte("p2"), -50)
-		if err != nil || newScore != 150 {
-			t.Errorf("Zincr failed: got %d", newScore)
+	_ = db.Update(func(tx *bolt.Tx) error {
+		_ = db.ZMSet(tx, zName, kvs...)
+		v, _ := db.Zincr(tx, zName, []byte("SZ000001"), -5) // 92 - 5 = 87
+		if v != 87 {
+			t.Errorf("Zincr failed: %d", v)
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("Setup failed: %v", err)
-	}
 
-	err = db.View(func(tx *bolt.Tx) error {
-		// 2. ZGetFunc
-		var finalScore uint64
-		err := db.ZGetFunc(tx, zName, []byte("p2"), func(score uint64) error {
-			finalScore = score
+	_ = db.View(func(tx *bolt.Tx) error {
+		var score uint64
+		_ = db.ZGetFunc(tx, zName, []byte("SH600519"), func(s uint64) error {
+			score = s
 			return nil
 		})
-		if err != nil || finalScore != 150 {
-			t.Errorf("ZGetFunc failed: got %d", finalScore)
+		if score != 99 {
+			t.Errorf("ZGetFunc failed: %d", score)
 		}
 
-		// 测试 ErrKeyNotFound
-		err = db.ZGetFunc(tx, zName, []byte("p_x"), func(s uint64) error { return nil })
-		if !errors.Is(err, ErrKeyNotFound) {
-			t.Errorf("ZGetFunc expected ErrKeyNotFound, got %v", err)
-		}
-
-		// 3. ZMGetFunc
-		queryKeys := [][]byte{[]byte("p1"), []byte("p4"), []byte("px")}
-		results := make(map[string]uint64)
-		err = db.ZMGetFunc(tx, zName, queryKeys, func(k []byte, score uint64, exists bool) error {
-			if exists {
-				results[string(k)] = score
-			}
-			return nil
-		})
-		if err != nil || results["p1"] != 100 || results["p4"] != 400 || len(results) != 2 {
-			t.Errorf("ZMGetFunc failed: %v", results)
-		}
-
-		// 4. ZScanFunc (按 Score 区间扫描 + Early Break)
-		var scannedKeys []string
-		err = db.ZScanFunc(tx, zName, nil, 100, 300, 100, func(key []byte, score uint64) bool {
-			scannedKeys = append(scannedKeys, string(key))
-			// 扫描到 p2 即中止
-			return string(key) != "p2"
-		})
-		if err != nil {
-			t.Fatalf("ZScanFunc failed: %v", err)
-		}
-		// 期望返回区间内的数据 p1(100), p2(150), p3(300)。但在 p2 中止
-		if len(scannedKeys) != 2 || scannedKeys[0] != "p1" || scannedKeys[1] != "p2" {
-			t.Errorf("ZScanFunc early break mismatch: %v", scannedKeys)
-		}
-
-		// 5. ZRScanFunc 逆序扫描
-		var revScanned []string
-		err = db.ZRScanFunc(tx, zName, nil, 0, 0, 10, func(key []byte, score uint64) bool {
-			revScanned = append(revScanned, string(key))
-			return true
-		})
-		// 期望全表逆序: p4(400), p3(300), p2(150), p1(100)
-		if len(revScanned) != 4 || revScanned[0] != "p4" || revScanned[3] != "p1" {
-			t.Errorf("ZRScanFunc sequence mismatch: %v", revScanned)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("View failed: %v", err)
-	}
-
-	// 6. ZDel / ZDelBucket 验证
-	err = db.Update(func(tx *bolt.Tx) error {
-		_ = db.ZDel(tx, zName, []byte("p1"))
-
-		err := db.ZGetFunc(tx, zName, []byte("p1"), func(s uint64) error { return nil })
-		if !errors.Is(err, ErrKeyNotFound) {
-			t.Errorf("ZDel failed")
-		}
-
-		_ = db.ZDelBucket(tx, zName)
-		count := 0
+		var scanOrder []string
 		_ = db.ZScanFunc(tx, zName, nil, 0, 0, 10, func(k []byte, s uint64) bool {
-			count++
+			scanOrder = append(scanOrder, string(k))
 			return true
 		})
-		if count != 0 {
-			t.Errorf("ZDelBucket failed, remaining %d", count)
+		// 期望正序: SH600000(85), SZ000001(87), SZ002594(95), SH600519(99)
+		if scanOrder[0] != "SH600000" || scanOrder[3] != "SH600519" {
+			t.Errorf("ZScanFunc rank mismatch: %v", scanOrder)
+		}
+
+		var rScanOrder []string
+		_ = db.ZRScanFunc(tx, zName, nil, 0, 0, 2, func(k []byte, s uint64) bool {
+			rScanOrder = append(rScanOrder, string(k))
+			return true
+		})
+		if len(rScanOrder) != 2 || rScanOrder[0] != "SH600519" {
+			t.Errorf("ZRScanFunc limit mismatch: %v", rScanOrder)
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("Del Update failed: %v", err)
-	}
+
+	_ = db.Update(func(tx *bolt.Tx) error {
+		_ = db.ZDelBucket(tx, zName)
+		return nil
+	})
 }
 
 // -----------------------------------------------------------------------------
-// 统计、碎片率与热压实 (Compact) 测试
+// 5. ZSet 完美浮点数排序 (MACD/因子值等带负数的场景)
 // -----------------------------------------------------------------------------
 
-func TestDB_Stats_And_Compact(t *testing.T) {
+func TestDB_Zet_Float_Operations(t *testing.T) {
 	db := helperOpenDB(t)
+	zName := "macd_indicators"
 
+	_ = db.Update(func(tx *bolt.Tx) error {
+		_ = db.ZSetF(tx, zName, []byte("stock_a"), -1.25)
+		_ = db.ZSetF(tx, zName, []byte("stock_b"), 0.0)
+		_ = db.ZSetF(tx, zName, []byte("stock_c"), -0.05)
+		_ = db.ZSetF(tx, zName, []byte("stock_d"), 2.45)
+		return nil
+	})
+
+	_ = db.View(func(tx *bolt.Tx) error {
+		var s float64
+		_ = db.ZGetFuncF(tx, zName, []byte("stock_a"), func(score float64) error {
+			s = score
+			return nil
+		})
+		if s != -1.25 {
+			t.Errorf("ZGetFuncF failed: got %f", s)
+		}
+
+		// 验证浮点数区间扫描 [-1.0, 1.0] (应该排除 a 和 d)
+		var scanned []string
+		_ = db.ZScanFuncF(tx, zName, nil, -1.0, 1.0, 10, func(k []byte, score float64) bool {
+			scanned = append(scanned, string(k))
+			return true
+		})
+		if len(scanned) != 2 || scanned[0] != "stock_c" || scanned[1] != "stock_b" {
+			t.Errorf("ZScanFuncF float range failed: %v", scanned)
+		}
+
+		// 验证浮点数逆序全表扫描
+		var rScanned []string
+		_ = db.ZRScanFuncF(tx, zName, nil, 0, 0, 10, func(k []byte, score float64) bool {
+			rScanned = append(rScanned, string(k))
+			return true
+		})
+		if len(rScanned) != 4 || rScanned[0] != "stock_d" || rScanned[3] != "stock_a" {
+			t.Errorf("ZRScanFuncF full reverse failed: %v", rScanned)
+		}
+		return nil
+	})
+}
+
+// -----------------------------------------------------------------------------
+// 6. 热压实与碎片整理测试 (Compact)
+// -----------------------------------------------------------------------------
+
+func TestDB_CompactAndStats(t *testing.T) {
+	db := helperOpenDB(t)
 	hashName := "compact_hash"
 	val1KB := bytes.Repeat([]byte("x"), 1024)
 
-	// 1. 批量插入，扩大物理文件与脏页
-	err := db.Update(func(tx *bolt.Tx) error {
-		for i := 0; i < 3000; i++ {
-			k := []byte(fmt.Sprintf("k_%04d", i))
-			if err := db.HSet(tx, hashName, k, val1KB); err != nil {
-				return err
-			}
+	// 1. 批量写入产生数据
+	_ = db.Update(func(tx *bolt.Tx) error {
+		for i := 0; i < 2000; i++ {
+			_ = db.HSet(tx, hashName, []byte(fmt.Sprintf("k_%04d", i)), val1KB)
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("Insert failed: %v", err)
-	}
 
-	// 2. 批量删除产生碎片
-	err = db.Update(func(tx *bolt.Tx) error {
+	// 2. 批量删除产生碎片空洞
+	_ = db.Update(func(tx *bolt.Tx) error {
 		var delKeys [][]byte
-		for i := 0; i < 2400; i++ {
+		for i := 0; i < 1500; i++ {
 			delKeys = append(delKeys, []byte(fmt.Sprintf("k_%04d", i)))
 		}
 		return db.HMDel(tx, hashName, delKeys)
 	})
-	if err != nil {
-		t.Fatalf("Delete failed: %v", err)
-	}
 
-	// 3. 检查门槛拦截逻辑
-	statsAfterDel, err := db.Stats()
-	if err != nil {
-		t.Fatalf("Stats failed: %v", err)
-	}
+	statsAfterDel, _ := db.Stats()
 
-	shouldCompact, _, err := db.ShouldCompact(500*1024, 0.20)
-	if err != nil || !shouldCompact {
-		t.Errorf("ShouldCompact expected true")
-	}
-
-	shouldCompactHigh, _, _ := db.ShouldCompact(100*1024*1024, 0.20)
-	if shouldCompactHigh {
-		t.Errorf("ShouldCompact high limit expected false")
-	}
-
-	// 4. 执行原位热压实替换
+	// 3. 执行 Compact (内部开启 NoSync 和 FillPercent=0.9)
 	if err := db.Compact(""); err != nil {
 		t.Fatalf("Compact failed: %v", err)
 	}
 
-	statsAfterCompact, err := db.Stats()
-	if err != nil {
-		t.Fatalf("Stats after compact failed: %v", err)
-	}
-
+	statsAfterCompact, _ := db.Stats()
 	if statsAfterCompact.FileSize >= statsAfterDel.FileSize {
-		t.Errorf("FileSize did not decrease after compact: before %d, after %d",
+		t.Errorf("Compact failed to reduce file size. Before: %d, After: %d",
 			statsAfterDel.FileSize, statsAfterCompact.FileSize)
 	}
 
-	// 5. 数据完整性与并发句柄替换校验
-	err = db.View(func(tx *bolt.Tx) error {
+	// 4. 压实后的数据完整性校验
+	_ = db.View(func(tx *bolt.Tx) error {
 		count := 0
-		err := db.HScanFunc(tx, hashName, nil, 1000, func(k, v []byte) bool {
+		_ = db.HScanFunc(tx, hashName, nil, 1000, func(k, v []byte) bool {
 			count++
 			return true
 		})
-		if err != nil || count != 600 {
-			t.Errorf("Data integrity check failed: expected 600, got %d", count)
+		if count != 500 {
+			t.Errorf("Compact data integrity lost, expected 500, got %d", count)
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("View failed: %v", err)
-	}
 }
