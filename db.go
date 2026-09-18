@@ -3,11 +3,9 @@ package mdb
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,11 +15,6 @@ import (
 )
 
 const (
-	replyOK                 = "ok"
-	replyNotFound           = "not_found"
-	replyError              = "error"
-	bucketNotFound          = "bucket_not_found"
-	keyNotFound             = "key_not_found"
 	kvpLen                  = "kvs len must is an even number"
 	scoreMin         uint64 = 0
 	scoreMax         uint64 = ^uint64(0)
@@ -39,33 +32,30 @@ var (
 	ErrKeyTooLong      = errors.New("key length exceeds 255 bytes")
 	ErrInvalidBuf      = errors.New("invalid buffer length")
 	ErrKeyValuePairLen = errors.New(kvpLen)
+	ErrKeyNotFound     = errors.New("key not found") // 统一未找到数据的错误提示
+
+	// keyBufPool 预分配对象池，消除高频读写时的 slice 内存分配
+	keyBufPool = sync.Pool{
+		New: func() interface{} {
+			// Max Name(255) + Max Key(255) + 9 Bytes overhead
+			b := make([]byte, 520)
+			return &b
+		},
+	}
 )
 
 type (
-	BS []byte
 	DB struct {
 		db *bolt.DB
-		wg sync.WaitGroup
-		mu sync.RWMutex
+		mu sync.RWMutex // 仅使用读写锁来保护在线 Compact 时的句柄热替换
 	}
 
-	// DBStats 存储数据库当前的状态信息
 	DBStats struct {
-		FilePath   string  `json:"file_path"`   // 磁盘文件路径
-		FileSize   int64   `json:"file_size"`   // 磁盘物理文件总大小 (Bytes)
-		DataSize   int64   `json:"data_size"`   // 有效 KV 数据总大小 (Bytes)
-		UsageRatio float64 `json:"usage_ratio"` // 空间有效利用率 (DataSize / FileSize)
-		FragRatio  float64 `json:"frag_ratio"`  // 磁盘碎片率 / 可压缩空间比例 (1 - UsageRatio)
-	}
-
-	Reply struct {
-		State string
-		Data  []BS
-	}
-
-	// Entry a key-value pair.
-	Entry struct {
-		Key, Value BS
+		FilePath   string  `json:"file_path"`
+		FileSize   int64   `json:"file_size"`
+		DataSize   int64   `json:"data_size"`
+		UsageRatio float64 `json:"usage_ratio"`
+		FragRatio  float64 `json:"frag_ratio"`
 	}
 )
 
@@ -73,7 +63,6 @@ func Open(path string) (*DB, error) {
 	return OpenWithMode(path, 0o600)
 }
 
-// OpenWithMode opens a database using the supplied file mode.
 func OpenWithMode(path string, mode os.FileMode) (*DB, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("empty database path")
@@ -94,7 +83,7 @@ func OpenWithMode(path string, mode os.FileMode) (*DB, error) {
 	return &DB{db: database}, nil
 }
 
-// View executes a read-only transaction.
+// View 执行只读事务 (去除了 WaitGroup，轻装上阵)
 func (d *DB) View(fn func(*bolt.Tx) error) error {
 	if d == nil {
 		return errors.New("nil database")
@@ -107,12 +96,10 @@ func (d *DB) View(fn func(*bolt.Tx) error) error {
 	if d.db == nil {
 		return errors.New("nil database")
 	}
-	d.wg.Add(1)
-	defer d.wg.Done()
 	return d.db.View(fn)
 }
 
-// Update executes a read-write transaction.
+// Update 执行读写事务
 func (d *DB) Update(fn func(*bolt.Tx) error) error {
 	if d == nil {
 		return errors.New("nil database")
@@ -125,8 +112,6 @@ func (d *DB) Update(fn func(*bolt.Tx) error) error {
 	if d.db == nil {
 		return errors.New("nil database")
 	}
-	d.wg.Add(1)
-	defer d.wg.Done()
 	return d.db.Update(fn)
 }
 
@@ -139,7 +124,6 @@ func (d *DB) Close() error {
 	if d.db == nil {
 		return nil
 	}
-	d.wg.Wait()
 	err := d.db.Close()
 	d.db = nil
 	return err
@@ -154,7 +138,11 @@ func (d *DB) HSet(tx *bolt.Tx, name string, key, val []byte) error {
 	if b == nil {
 		return ErrNilBucket
 	}
-	reallyKey, err := EncodeHashKey(name, key)
+
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
 	if err != nil {
 		return err
 	}
@@ -170,8 +158,12 @@ func (d *DB) HMSet(tx *bolt.Tx, name string, kvs ...[]byte) error {
 		return ErrNilBucket
 	}
 
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	for i := 0; i < len(kvs)-1; i += 2 {
-		reallyKey, err := EncodeHashKey(name, kvs[i])
+		reallyKey, err := encodeHashKeyToBuf(name, kvs[i], buf)
 		if err != nil {
 			return err
 		}
@@ -183,15 +175,16 @@ func (d *DB) HMSet(tx *bolt.Tx, name string, kvs ...[]byte) error {
 	return nil
 }
 
-// Hincr 对 Hash 中指定 key 的数值进行自增/自减操作，并返回更新后的值。
-// 如果 key 不存在，初始值视为 0。
 func (d *DB) Hincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, error) {
 	b := tx.Bucket(bucketHash)
 	if b == nil {
 		return 0, ErrNilBucket
 	}
 
-	reallyKey, err := EncodeHashKey(name, key)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
 	if err != nil {
 		return 0, err
 	}
@@ -201,15 +194,16 @@ func (d *DB) Hincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, er
 	if len(v) == uint64EncodedLen {
 		current = B2i(v)
 	} else if len(v) > 0 {
-		var parseErr error
-		current, parseErr = strconv.ParseUint(string(v), 10, 64)
+		// 零拷贝解析数值
+		parsedUint, parseErr := parseUintBytes(v)
 		if parseErr != nil {
-			// 若按 uint64 解析失败，尝试按 int64 解析
-			iVal, parseErr2 := strconv.ParseInt(string(v), 10, 64)
+			parsedInt, parseErr2 := parseIntBytes(v)
 			if parseErr2 != nil {
-				return 0, fmt.Errorf("hash value is not a valid integer: %v", parseErr)
+				return 0, fmt.Errorf("hash value is not a valid integer")
 			}
-			current = uint64(iVal)
+			current = uint64(parsedInt)
+		} else {
+			current = parsedUint
 		}
 	}
 
@@ -223,201 +217,177 @@ func (d *DB) Hincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, er
 	return newVal, nil
 }
 
-func (d *DB) HGet(tx *bolt.Tx, name string, key []byte) *Reply {
-	r := &Reply{State: replyError, Data: []BS{}}
+// HGetFunc 安全回调式读取，消除内存分配与 Mmap 访问越界隐患
+func (d *DB) HGetFunc(tx *bolt.Tx, name string, key []byte, fn func(val []byte) error) error {
 	b := tx.Bucket(bucketHash)
 	if b == nil {
-		r.State = bucketNotFound
-		return r
+		return ErrNilBucket
 	}
-	reallyKey, err := EncodeHashKey(name, key)
+
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
+
 	v := b.Get(reallyKey)
 	if v == nil {
-		r.State = keyNotFound
-		return r
+		return ErrKeyNotFound
 	}
-	r.State = replyOK
-	r.Data = append(r.Data, v)
-	return r
+	return fn(v)
 }
 
-// HMGet 批量获取 Hash 中多个 key 的 value。
-// 返回 Reply.Data 格式为 [k1, v1, k2, v2, ...]
-func (d *DB) HMGet(tx *bolt.Tx, name string, keys [][]byte) *Reply {
-	r := &Reply{
-		State: replyError,
-		Data:  make([]BS, 0, len(keys)*2),
-	}
-
+// HMGetFunc 批量回调读取
+// fn 的第二个参数 val 如果是 nil，代表该 key 不存在
+func (d *DB) HMGetFunc(tx *bolt.Tx, name string, keys [][]byte, fn func(key, val []byte) error) error {
 	b := tx.Bucket(bucketHash)
 	if b == nil {
-		r.State = bucketNotFound
-		return r
+		return ErrNilBucket
 	}
 
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	for _, key := range keys {
-		reallyKey, err := EncodeHashKey(name, key)
+		reallyKey, err := encodeHashKeyToBuf(name, key, buf)
 		if err != nil {
-			r.Data = append(r.Data, key, nil)
 			continue
 		}
 		v := b.Get(reallyKey)
-		r.Data = append(r.Data, key, v)
+		if err := fn(key, v); err != nil {
+			return err
+		}
 	}
-
-	r.State = replyOK
-	return r
+	return nil
 }
 
-func (d *DB) HScan(tx *bolt.Tx, name string, keyStart []byte, limit int) *Reply {
-	r := &Reply{
-		State: replyError,
-		Data:  []BS{},
+// HScanFunc 正序扫描。若回调 fn 返回 false，则终止遍历。
+func (d *DB) HScanFunc(tx *bolt.Tx, name string, keyStart []byte, limit int, fn func(key, val []byte) bool) error {
+	if limit <= 0 {
+		return nil
 	}
-
 	b := tx.Bucket(bucketHash)
 	if b == nil {
-		r.State = bucketNotFound
-		return r
+		return ErrNilBucket
 	}
 
-	// 计算遍历起始的完整 Key
-	reallyKeyStart, err := EncodeHashKey(name, keyStart)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	reallyKeyStart, err := encodeHashKeyToBuf(name, keyStart, buf)
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
 
-	// 计算当前 Hash 表(name)的前缀
-	prefix, err := EncodeHashKey(name, nil)
+	prefix, err := encodeHashKeyToBuf(name, nil, buf)
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
+	// 为了不被迭代修改覆盖，克隆 prefix
+	prefixCopy := append([]byte(nil), prefix...)
+	prefixLen := len(prefixCopy)
 
-	prefixLen := len(prefix)
 	c := b.Cursor()
 	n := 0
 
 	for k, v := c.Seek(reallyKeyStart); k != nil; k, v = c.Next() {
-		// 1. 前缀校验：一旦 Key 不再包含当前 name 的前缀，说明已遍历完该 Hash 表，立即退出
-		if !bytes.HasPrefix(k, prefix) {
+		if !bytes.HasPrefix(k, prefixCopy) {
 			break
 		}
-
-		// 2. 跳过 keyStart 本身（HScan 语义为遍历大于 keyStart 的元素）
 		if bytes.Compare(k, reallyKeyStart) <= 0 {
 			continue
 		}
 
-		r.Data = append(r.Data, k[prefixLen:], v)
+		if !fn(k[prefixLen:], v) {
+			break
+		}
 		n++
 		if n == limit {
 			break
 		}
 	}
-
-	r.State = replyOK
-	return r
+	return nil
 }
 
-// HRScan 逆序遍历 Hash 数据 (Reverse Scan)
-// keyStart 为空时，从当前 Hash 表的最大 Key 开始逆序遍历；
-// keyStart 非空时，遍历小于 keyStart 的元素。
-func (d *DB) HRScan(tx *bolt.Tx, name string, keyStart []byte, limit int) *Reply {
-	r := &Reply{
-		State: replyError,
-		Data:  []BS{},
-	}
-
+// HRScanFunc 逆序扫描
+func (d *DB) HRScanFunc(tx *bolt.Tx, name string, keyStart []byte, limit int, fn func(key, val []byte) bool) error {
 	if limit <= 0 {
-		r.State = replyOK
-		return r
+		return nil
 	}
-
 	b := tx.Bucket(bucketHash)
 	if b == nil {
-		r.State = bucketNotFound
-		return r
+		return ErrNilBucket
 	}
 
-	// 计算当前 Hash 表的前缀
-	prefix, err := EncodeHashKey(name, nil)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	prefix, err := encodeHashKeyToBuf(name, nil, buf)
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
-	prefixLen := len(prefix)
+	prefixCopy := append([]byte(nil), prefix...)
+	prefixLen := len(prefixCopy)
 
 	var seekKey []byte
 	isStartEmpty := len(keyStart) == 0
 
 	if isStartEmpty {
-		// 当 keyStart 为空时，生成当前 name 可能的最大 Key（Key 最大 255 字节），用于定位到 name 的末尾
-		maxKey, err := EncodeHashKey(name, bytes.Repeat([]byte{0xFF}, 255))
-		if err != nil {
-			r.State = err.Error()
-			return r
-		}
-		seekKey = maxKey
+		seekKey, err = EncodeHashKey(name, bytes.Repeat([]byte{0xFF}, 255))
 	} else {
-		reallyKeyStart, err := EncodeHashKey(name, keyStart)
-		if err != nil {
-			r.State = err.Error()
-			return r
-		}
-		seekKey = reallyKeyStart
+		seekKey, err = EncodeHashKey(name, keyStart)
+	}
+	if err != nil {
+		return err
 	}
 
 	c := b.Cursor()
 	k, v := c.Seek(seekKey)
 	if k == nil {
-		// 如果 seekKey 超出了整张 bucket 的末尾，从 bucket 的最后一个 key 开始逆序查找
 		k, v = c.Last()
 	}
 
 	n := 0
 	for k != nil {
-		// 1. 下界检查：如果当前 Key 的字节序已经小于当前 name 的前缀，说明已遍历完该 Hash 表，立即退出
-		if bytes.Compare(k, prefix) < 0 {
+		if bytes.Compare(k, prefixCopy) < 0 {
 			break
 		}
 
-		// 2. 属于当前 name 前缀的合法数据
-		if bytes.HasPrefix(k, prefix) {
-			// 如果指定了 keyStart，过滤掉大于等于 keyStart 的元素（保证只获取 strictly小于 keyStart 的元素）
+		if bytes.HasPrefix(k, prefixCopy) {
 			if !isStartEmpty && bytes.Compare(k, seekKey) >= 0 {
 				k, v = c.Prev()
 				continue
 			}
 
-			r.Data = append(r.Data, k[prefixLen:], v)
+			if !fn(k[prefixLen:], v) {
+				break
+			}
 			n++
 			if n == limit {
 				break
 			}
 		}
 
-		// 游标向上（逆序）移动
 		k, v = c.Prev()
 	}
-
-	r.State = replyOK
-	return r
+	return nil
 }
 
-// HDel 删除 Hash 中的单个 key。
 func (d *DB) HDel(tx *bolt.Tx, name string, key []byte) error {
 	b := tx.Bucket(bucketHash)
 	if b == nil {
 		return ErrNilBucket
 	}
 
-	reallyKey, err := EncodeHashKey(name, key)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
 	if err != nil {
 		return err
 	}
@@ -425,15 +395,18 @@ func (d *DB) HDel(tx *bolt.Tx, name string, key []byte) error {
 	return b.Delete(reallyKey)
 }
 
-// HMDel 批量删除 Hash 中的多个 key。
 func (d *DB) HMDel(tx *bolt.Tx, name string, keys [][]byte) error {
 	b := tx.Bucket(bucketHash)
 	if b == nil {
 		return ErrNilBucket
 	}
 
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	for _, key := range keys {
-		reallyKey, err := EncodeHashKey(name, key)
+		reallyKey, err := encodeHashKeyToBuf(name, key, buf)
 		if err != nil {
 			return err
 		}
@@ -441,36 +414,29 @@ func (d *DB) HMDel(tx *bolt.Tx, name string, keys [][]byte) error {
 			return err
 		}
 	}
-
 	return nil
 }
 
-// HDelBucket 清空指定 name 的整个 Hash 表中的所有数据。
 func (d *DB) HDelBucket(tx *bolt.Tx, name string) error {
 	b := tx.Bucket(bucketHash)
 	if b == nil {
 		return ErrNilBucket
 	}
 
-	prefix, err := EncodeHashKey(name, nil)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	prefix, err := encodeHashKeyToBuf(name, nil, *bufPtr)
 	if err != nil {
 		return err
 	}
 
 	c := b.Cursor()
-	var keysToDelete [][]byte
-	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-		kCopy := make([]byte, len(k))
-		copy(kCopy, k)
-		keysToDelete = append(keysToDelete, kCopy)
-	}
-
-	for _, k := range keysToDelete {
-		if err := b.Delete(k); err != nil {
+	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Seek(prefix) {
+		if err := c.Delete(); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -483,25 +449,26 @@ func (d *DB) ZSet(tx *bolt.Tx, name string, key []byte, score uint64) error {
 	if b1 == nil {
 		return ErrNilBucket
 	}
-	reallyKey, err := EncodeHashKey(name, key)
+
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
 	if err != nil {
 		return err
 	}
 
 	scoreByte := I2b(score)
-
-	// get old score
 	oldScoreByte := b1.Get(reallyKey)
 	if bytes.Equal(oldScoreByte, scoreByte) {
 		return nil
 	}
 
-	// set new score kv
 	if err = b1.Put(reallyKey, scoreByte); err != nil {
 		return err
 	}
-	// set new score k
-	reallyScoreKey, err := EncodeZsetScoreKey(name, key, score)
+
+	reallyScoreKey, err := encodeZsetScoreKeyToBuf(name, key, score, *bufPtr)
 	if err != nil {
 		return err
 	}
@@ -516,7 +483,7 @@ func (d *DB) ZSet(tx *bolt.Tx, name string, key []byte, score uint64) error {
 	}
 
 	if len(oldScoreByte) == uint64EncodedLen {
-		reallyScoreKey, err = EncodeZsetScoreKey(name, key, B2i(oldScoreByte))
+		reallyScoreKey, err = encodeZsetScoreKeyToBuf(name, key, B2i(oldScoreByte), *bufPtr)
 		if err != nil {
 			return err
 		}
@@ -528,8 +495,6 @@ func (d *DB) ZSet(tx *bolt.Tx, name string, key []byte, score uint64) error {
 	return nil
 }
 
-// ZMSet 批量设置 Zet 成员及其 score。
-// kvs 格式为 [key1, score1, key2, score2, ...]，score 支持 8 字节 BigEndian 或数字字符串。
 func (d *DB) ZMSet(tx *bolt.Tx, name string, kvs ...[]byte) error {
 	if len(kvs) == 0 || len(kvs)%2 != 0 {
 		return ErrKeyValuePairLen
@@ -542,25 +507,29 @@ func (d *DB) ZMSet(tx *bolt.Tx, name string, kvs ...[]byte) error {
 		if len(scoreBuf) == uint64EncodedLen {
 			score = B2i(scoreBuf)
 		} else {
-			score = DS2i(B2s(scoreBuf))
+			parsedUint, parseErr := parseUintBytes(scoreBuf)
+			if parseErr != nil {
+				return fmt.Errorf("zset score is not a valid uint: %v", parseErr)
+			}
+			score = parsedUint
 		}
 		if err := d.ZSet(tx, name, key, score); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
-// Zincr 对 Zet 中指定 member 的 score 进行自增/自减操作，并返回更新后的 score。
-// 如果 member 不存在，初始 score 视为 0。
 func (d *DB) Zincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, error) {
 	b1 := tx.Bucket(bucketZetMember)
 	if b1 == nil {
 		return 0, ErrNilBucket
 	}
 
-	reallyKey, err := EncodeHashKey(name, key)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
 	if err != nil {
 		return 0, err
 	}
@@ -570,12 +539,14 @@ func (d *DB) Zincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, er
 	if len(v) == uint64EncodedLen {
 		current = B2i(v)
 	} else if len(v) > 0 {
-		current = DS2i(B2s(v))
+		parsedUint, parseErr := parseUintBytes(v)
+		if parseErr == nil {
+			current = parsedUint
+		}
 	}
 
 	newScore := uint64(int64(current) + step)
 
-	// 复用 ZSet 更新成员 Score 并重置 ZSetScore 索引
 	if err := d.ZSet(tx, name, key, newScore); err != nil {
 		return 0, err
 	}
@@ -583,112 +554,112 @@ func (d *DB) Zincr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, er
 	return newScore, nil
 }
 
-func (d *DB) ZGet(tx *bolt.Tx, name string, key []byte) *Reply {
-	r := &Reply{
-		State: replyError,
-		Data:  []BS{},
-	}
-
-	reallyKey, err := EncodeHashKey(name, key)
-	if err != nil {
-		r.State = err.Error()
-		return r
-	}
-
+// ZGetFunc 读取并回调成员 score
+func (d *DB) ZGetFunc(tx *bolt.Tx, name string, key []byte, fn func(score uint64) error) error {
 	b := tx.Bucket(bucketZetMember)
 	if b == nil {
-		r.State = ErrNilBucket.Error()
-		return r
+		return ErrNilBucket
+	}
+
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
+	if err != nil {
+		return err
 	}
 
 	v := b.Get(reallyKey)
 	if v == nil {
-		r.State = keyNotFound
-		return r
+		return ErrKeyNotFound
 	}
 
-	r.State = replyOK
-	r.Data = append(r.Data, v)
+	var score uint64
+	if len(v) == uint64EncodedLen {
+		score = B2i(v)
+	} else {
+		score, _ = parseUintBytes(v)
+	}
 
-	return r
+	return fn(score)
 }
 
-// ZMGet 批量获取 Zet 中多个 member 的 score。
-// 返回 Reply.Data 格式为 [k1, score1, k2, score2, ...]
-func (d *DB) ZMGet(tx *bolt.Tx, name string, keys [][]byte) *Reply {
-	r := &Reply{
-		State: replyError,
-		Data:  make([]BS, 0, len(keys)*2),
-	}
-
+// ZMGetFunc 批量获取 member。回调参数 includesExists 用来标识是否命中
+func (d *DB) ZMGetFunc(tx *bolt.Tx, name string, keys [][]byte, fn func(key []byte, score uint64, exists bool) error) error {
 	b := tx.Bucket(bucketZetMember)
 	if b == nil {
-		r.State = bucketNotFound
-		return r
+		return ErrNilBucket
 	}
+
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
 
 	for _, key := range keys {
-		reallyKey, err := EncodeHashKey(name, key)
+		reallyKey, err := encodeHashKeyToBuf(name, key, buf)
 		if err != nil {
-			r.Data = append(r.Data, key, nil)
 			continue
 		}
-		v := b.Get(reallyKey)
-		r.Data = append(r.Data, key, v)
-	}
 
-	r.State = replyOK
-	return r
+		v := b.Get(reallyKey)
+		if v == nil {
+			if err := fn(key, 0, false); err != nil {
+				return err
+			}
+			continue
+		}
+
+		var score uint64
+		if len(v) == uint64EncodedLen {
+			score = B2i(v)
+		} else {
+			score, _ = parseUintBytes(v)
+		}
+
+		if err := fn(key, score, true); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// ZScan 正序遍历 Zet 数据 (Scan by Score & Key)
-// 按 score 升序及 key 字典序升序遍历。
-// keyStart 与 scoreStart 指定起始点（结果不包含起始点本身）；
-// keyStart 为空且 scoreStart 为 0 时从最小值开始遍历；
-// scoreEnd 为 0 或小于 scoreStart 时默认遍历至最大 score。
-func (d *DB) ZScan(tx *bolt.Tx, name string, keyStart []byte, scoreStart, scoreEnd uint64, limit int) *Reply {
-	r := &Reply{
-		State: replyError,
-		Data:  []BS{},
-	}
-
+// ZScanFunc 正序扫描 Score 及 Key。若 fn 返回 false 则提前终止。
+func (d *DB) ZScanFunc(tx *bolt.Tx, name string, keyStart []byte, scoreStart, scoreEnd uint64, limit int, fn func(key []byte, score uint64) bool) error {
 	if limit <= 0 {
-		r.State = replyOK
-		return r
+		return nil
 	}
-
 	b := tx.Bucket(bucketZetScore)
 	if b == nil {
-		r.State = bucketNotFound
-		return r
+		return ErrNilBucket
 	}
 
 	if scoreEnd == 0 || scoreEnd < scoreStart {
 		scoreEnd = scoreMax
 	}
 
-	prefix, err := EncodeHashKey(name, nil)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	prefix, err := encodeHashKeyToBuf(name, nil, buf)
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
+	prefixCopy := append([]byte(nil), prefix...)
 
 	reallyKeyStart, err := EncodeZsetScoreKey(name, keyStart, scoreStart)
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
 
 	c := b.Cursor()
 	n := 0
 
 	for k, _ := c.Seek(reallyKeyStart); k != nil; k, _ = c.Next() {
-		// 1. 前缀检查：超出当前 name 的范围则退出
-		if !bytes.HasPrefix(k, prefix) {
+		if !bytes.HasPrefix(k, prefixCopy) {
 			break
 		}
 
-		// 2. 解码并检查 score 上限
 		_, key, score, err := DecodeZsetScoreKey(k)
 		if err != nil {
 			continue
@@ -697,42 +668,29 @@ func (d *DB) ZScan(tx *bolt.Tx, name string, keyStart []byte, scoreStart, scoreE
 			break
 		}
 
-		// 3. 跳过小于等于 (scoreStart, keyStart) 的节点
 		if bytes.Compare(k, reallyKeyStart) <= 0 {
 			continue
 		}
 
-		r.Data = append(r.Data, key, I2b(score))
+		if !fn(key, score) {
+			break
+		}
 		n++
 		if n == limit {
 			break
 		}
 	}
-
-	r.State = replyOK
-	return r
+	return nil
 }
 
-// ZRScan 逆序遍历 Zet 数据 (Reverse Scan by Score & Key)
-// 按 score 降序及 key 字典序降序遍历。
-// scoreStart 与 keyStart 指定起始点（结果不包含起始点本身）；
-// scoreStart 为 0 且 keyStart 为空时从最大值开始遍历；
-// scoreEnd 大于 scoreStart 时默认下界为 0 (scoreMin)。
-func (d *DB) ZRScan(tx *bolt.Tx, name string, keyStart []byte, scoreStart, scoreEnd uint64, limit int) *Reply {
-	r := &Reply{
-		State: replyError,
-		Data:  []BS{},
-	}
-
+// ZRScanFunc 逆序扫描 Score 及 Key。
+func (d *DB) ZRScanFunc(tx *bolt.Tx, name string, keyStart []byte, scoreStart, scoreEnd uint64, limit int, fn func(key []byte, score uint64) bool) error {
 	if limit <= 0 {
-		r.State = replyOK
-		return r
+		return nil
 	}
-
 	b := tx.Bucket(bucketZetScore)
 	if b == nil {
-		r.State = bucketNotFound
-		return r
+		return ErrNilBucket
 	}
 
 	isStartEmpty := scoreStart == 0 && len(keyStart) == 0
@@ -743,22 +701,24 @@ func (d *DB) ZRScan(tx *bolt.Tx, name string, keyStart []byte, scoreStart, score
 		scoreEnd = scoreMin
 	}
 
-	prefix, err := EncodeHashKey(name, nil)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	prefix, err := encodeHashKeyToBuf(name, nil, buf)
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
+	prefixCopy := append([]byte(nil), prefix...)
 
 	var seekKey []byte
 	if isStartEmpty {
-		// 定位到当前 name 在 scoreMax 下最大的 key
 		seekKey, err = EncodeZsetScoreKey(name, bytes.Repeat([]byte{0xFF}, 255), scoreMax)
 	} else {
 		seekKey, err = EncodeZsetScoreKey(name, keyStart, scoreStart)
 	}
 	if err != nil {
-		r.State = err.Error()
-		return r
+		return err
 	}
 
 	c := b.Cursor()
@@ -769,31 +729,29 @@ func (d *DB) ZRScan(tx *bolt.Tx, name string, keyStart []byte, scoreStart, score
 
 	n := 0
 	for k != nil {
-		// 1. 下界检查：游标移出当前 name 的范围，立即退出
-		if bytes.Compare(k, prefix) < 0 {
+		if bytes.Compare(k, prefixCopy) < 0 {
 			break
 		}
 
-		// 2. 落在当前 name 范围的数据处理
-		if bytes.HasPrefix(k, prefix) {
+		if bytes.HasPrefix(k, prefixCopy) {
 			_, key, score, err := DecodeZsetScoreKey(k)
 			if err != nil {
 				k, _ = c.Prev()
 				continue
 			}
 
-			// 检查 score 下限
 			if score < scoreEnd {
 				break
 			}
 
-			// 过滤大于等于起始位置的数据（非全表起点时）
 			if !isStartEmpty && bytes.Compare(k, seekKey) >= 0 {
 				k, _ = c.Prev()
 				continue
 			}
 
-			r.Data = append(r.Data, key, I2b(score))
+			if !fn(key, score) {
+				break
+			}
 			n++
 			if n == limit {
 				break
@@ -802,16 +760,9 @@ func (d *DB) ZRScan(tx *bolt.Tx, name string, keyStart []byte, scoreStart, score
 
 		k, _ = c.Prev()
 	}
-
-	r.State = replyOK
-	return r
+	return nil
 }
 
-// -------------------
-// Zet 删除函数
-// -------------------
-
-// ZDel 删除 Zet 中的单个 member（同时清理 member 映射与 score 排序索引）。
 func (d *DB) ZDel(tx *bolt.Tx, name string, key []byte) error {
 	b1 := tx.Bucket(bucketZetMember)
 	b2 := tx.Bucket(bucketZetScore)
@@ -819,30 +770,31 @@ func (d *DB) ZDel(tx *bolt.Tx, name string, key []byte) error {
 		return ErrNilBucket
 	}
 
-	reallyKey, err := EncodeHashKey(name, key)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeHashKeyToBuf(name, key, *bufPtr)
 	if err != nil {
 		return err
 	}
 
 	oldScoreByte := b1.Get(reallyKey)
 	if oldScoreByte == nil {
-		return nil // key 不存在，直接返回
+		return nil
 	}
 
-	// 1. 从 Member 桶中删除
 	if err := b1.Delete(reallyKey); err != nil {
 		return err
 	}
 
-	// 2. 解析旧 score 并从 Score 索引桶中删除
 	var oldScore uint64
 	if len(oldScoreByte) == uint64EncodedLen {
 		oldScore = B2i(oldScoreByte)
 	} else if len(oldScoreByte) > 0 {
-		oldScore = DS2i(B2s(oldScoreByte))
+		oldScore, _ = parseUintBytes(oldScoreByte)
 	}
 
-	reallyScoreKey, err := EncodeZsetScoreKey(name, key, oldScore)
+	reallyScoreKey, err := encodeZsetScoreKeyToBuf(name, key, oldScore, *bufPtr)
 	if err != nil {
 		return err
 	}
@@ -850,7 +802,6 @@ func (d *DB) ZDel(tx *bolt.Tx, name string, key []byte) error {
 	return b2.Delete(reallyScoreKey)
 }
 
-// ZMDel 批量删除 Zet 中的多个 member。
 func (d *DB) ZMDel(tx *bolt.Tx, name string, keys [][]byte) error {
 	for _, key := range keys {
 		if err := d.ZDel(tx, name, key); err != nil {
@@ -860,7 +811,6 @@ func (d *DB) ZMDel(tx *bolt.Tx, name string, keys [][]byte) error {
 	return nil
 }
 
-// ZDelBucket 清空指定 name 的整个 Zet 中的所有成员及排序索引。
 func (d *DB) ZDelBucket(tx *bolt.Tx, name string) error {
 	b1 := tx.Bucket(bucketZetMember)
 	b2 := tx.Bucket(bucketZetScore)
@@ -868,35 +818,24 @@ func (d *DB) ZDelBucket(tx *bolt.Tx, name string) error {
 		return ErrNilBucket
 	}
 
-	prefix, err := EncodeHashKey(name, nil)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	prefix, err := encodeHashKeyToBuf(name, nil, *bufPtr)
 	if err != nil {
 		return err
 	}
 
-	// 1. 清理 bucketZetMember
 	c1 := b1.Cursor()
-	var keysToDelete1 [][]byte
-	for k, _ := c1.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c1.Next() {
-		kCopy := make([]byte, len(k))
-		copy(kCopy, k)
-		keysToDelete1 = append(keysToDelete1, kCopy)
-	}
-	for _, k := range keysToDelete1 {
-		if err := b1.Delete(k); err != nil {
+	for k, _ := c1.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c1.Seek(prefix) {
+		if err := c1.Delete(); err != nil {
 			return err
 		}
 	}
 
-	// 2. 清理 bucketZetScore
 	c2 := b2.Cursor()
-	var keysToDelete2 [][]byte
-	for k, _ := c2.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c2.Next() {
-		kCopy := make([]byte, len(k))
-		copy(kCopy, k)
-		keysToDelete2 = append(keysToDelete2, kCopy)
-	}
-	for _, k := range keysToDelete2 {
-		if err := b2.Delete(k); err != nil {
+	for k, _ := c2.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c2.Seek(prefix) {
+		if err := c2.Delete(); err != nil {
 			return err
 		}
 	}
@@ -908,7 +847,6 @@ func (d *DB) ZDelBucket(tx *bolt.Tx, name string) error {
 // 统计与压缩功能函数
 // -----------------------
 
-// Stats 获取当前数据库的状态信息，包括物理体积、有效数据字节数、空间利用率和碎片率。
 func (d *DB) Stats() (*DBStats, error) {
 	if d == nil {
 		return nil, errors.New("nil database")
@@ -929,9 +867,7 @@ func (d *DB) Stats() (*DBStats, error) {
 	fileSize := fi.Size()
 
 	var dataSize int64
-	d.wg.Add(1)
 	err = d.db.View(func(tx *bolt.Tx) error {
-		defer d.wg.Done()
 		return tx.ForEach(func(name []byte, b *bolt.Bucket) error {
 			return b.ForEach(func(k, v []byte) error {
 				dataSize += int64(len(k) + len(v))
@@ -961,21 +897,16 @@ func (d *DB) Stats() (*DBStats, error) {
 	}, nil
 }
 
-// ShouldCompact 评估当前数据库是否需要执行压缩整理。
-// minFileSize: 触发压缩的最小物理文件字节数（避开数据量太小的情况，例如 4*1024*1024 即 4MB）。
-// minFragRatio: 触发压缩的最小碎片率/浪费率门槛（0.0~1.0，例如 0.20 代表碎片率达到 20% 才进行压缩）。
 func (d *DB) ShouldCompact(minFileSize int64, minFragRatio float64) (bool, *DBStats, error) {
 	stats, err := d.Stats()
 	if err != nil {
 		return false, nil, err
 	}
 
-	// 1. 物理文件过小，压缩收益极微，不建议压缩
 	if stats.FileSize < minFileSize {
 		return false, stats, nil
 	}
 
-	// 2. 碎片率没有达到门槛，空间浪费不大，不建议压缩
 	if stats.FragRatio < minFragRatio {
 		return false, stats, nil
 	}
@@ -983,9 +914,6 @@ func (d *DB) ShouldCompact(minFileSize int64, minFragRatio float64) (bool, *DBSt
 	return true, stats, nil
 }
 
-// Compact 执行数据库压缩整理。
-// 如果 dstPath 为空或等于当前 DB 路径，则进行安全的原地产生/替换 (In-Place Compact)；
-// 如果 dstPath 为新路径，则将压缩后的新数据库另存为该文件。
 func (d *DB) Compact(dstPath string) error {
 	if d == nil {
 		return errors.New("nil database")
@@ -1005,7 +933,6 @@ func (d *DB) Compact(dstPath string) error {
 		targetPath = origPath + ".compact.tmp"
 	}
 
-	// 1. 拷贝整理全量数据至目标临时/新文件
 	d.mu.RLock()
 	err := compactDB(d.db, targetPath, 0o600)
 	d.mu.RUnlock()
@@ -1016,17 +943,12 @@ func (d *DB) Compact(dstPath string) error {
 		return err
 	}
 
-	// 2. 如果仅为导出另存为新文件，直接结束
 	if !isInPlace {
 		return nil
 	}
 
-	// 3. 原地替换：获取写锁，安全等待活跃事务完成并替换 DB 句柄
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
-	// 等待所有已有读写事务处理完
-	d.wg.Wait()
 
 	if err := d.db.Close(); err != nil {
 		_ = os.Remove(targetPath)
@@ -1047,7 +969,6 @@ func (d *DB) Compact(dstPath string) error {
 	return nil
 }
 
-// compactDB 内部辅助函数：逐桶/逐条记录顺序写入目标文件，生成填充率最高、零碎片的数据库
 func compactDB(srcDB *bolt.DB, dstPath string, mode os.FileMode) error {
 	dstDB, err := bolt.Open(dstPath, mode, &bolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
@@ -1055,285 +976,122 @@ func compactDB(srcDB *bolt.DB, dstPath string, mode os.FileMode) error {
 	}
 	defer dstDB.Close()
 
+	const batchSize = 10000
+
 	return srcDB.View(func(srcTx *bolt.Tx) error {
-		return dstDB.Update(func(dstTx *bolt.Tx) error {
-			return srcTx.ForEach(func(name []byte, b *bolt.Bucket) error {
-				dstBucket, err := dstTx.CreateBucketIfNotExists(name)
+		return srcTx.ForEach(func(name []byte, b *bolt.Bucket) error {
+			err := dstDB.Update(func(dstTx *bolt.Tx) error {
+				_, err := dstTx.CreateBucketIfNotExists(name)
+				return err
+			})
+			if err != nil {
+				return err
+			}
+
+			c := b.Cursor()
+			k, v := c.First()
+			for k != nil {
+				err := dstDB.Update(func(dstTx *bolt.Tx) error {
+					dstBucket := dstTx.Bucket(name)
+					count := 0
+					for k != nil && count < batchSize {
+						if err := dstBucket.Put(k, v); err != nil {
+							return err
+						}
+						k, v = c.Next()
+						count++
+					}
+					return nil
+				})
 				if err != nil {
 					return err
 				}
-				return b.ForEach(func(k, v []byte) error {
-					return dstBucket.Put(k, v)
-				})
-			})
+			}
+			return nil
 		})
 	})
-}
-
-// -----------
-// Reply 辅助函数
-// -----------
-
-func (r *Reply) OK() bool {
-	return r.State == replyOK
-}
-
-func (r *Reply) NotFound() bool {
-	return r.State == replyNotFound
-}
-
-// Clone 深度拷贝 Reply 中的 mmap 数据。
-// 重要：如果在 bolt.Tx 事务闭包外使用 Reply 数据，必须调用此方法以防止段错误。
-func (r *Reply) Clone() *Reply {
-	if len(r.Data) == 0 {
-		return r
-	}
-	newReply := &Reply{
-		State: r.State,
-		Data:  make([]BS, len(r.Data)),
-	}
-	for i, b := range r.Data {
-		copied := make([]byte, len(b))
-		copy(copied, b)
-		newReply.Data[i] = copied
-	}
-	return newReply
-}
-
-func (r *Reply) Bytes() []byte {
-	if len(r.Data) > 0 {
-		return r.Data[0]
-	}
-	return nil
-}
-
-// String is a convenience wrapper over Get for string value.
-func (r *Reply) String() string {
-	if len(r.Data) > 0 {
-		return B2s(r.Data[0])
-	}
-	return ""
-}
-
-// Int is a convenience wrapper over Get for int value of a hashmap.
-func (r *Reply) Int() int {
-	return int(r.Uint64())
-}
-
-// Int64 is a convenience wrapper over Get for int64 value of a hashmap.
-func (r *Reply) Int64() int64 {
-	if len(r.Data) < 1 {
-		return 0
-	}
-	return int64(r.Uint64())
-}
-
-// Uint is a convenience wrapper over Get for uint value of a hashmap.
-func (r *Reply) Uint() uint {
-	return uint(r.Uint64())
-}
-
-// Uint64 is a convenience wrapper over Get for uint64 value of a hashmap.
-func (r *Reply) Uint64() uint64 {
-	if len(r.Data) < 1 {
-		return 0
-	}
-	if len(r.Data[0]) < uint64EncodedLen {
-		return 0
-	}
-	return binary.BigEndian.Uint64(r.Data[0])
-}
-
-// List retrieves the key/value pairs from reply of a hashmap.
-func (r *Reply) List() []Entry {
-	if len(r.Data) < 1 {
-		return []Entry{}
-	}
-	list := make([]Entry, len(r.Data)/2)
-	j := 0
-	for i := 0; i < (len(r.Data) - 1); i += 2 {
-		list[j] = Entry{r.Data[i], r.Data[i+1]}
-		j++
-	}
-	return list
-}
-
-// Dict retrieves the key/value pairs from reply of a hashmap.
-func (r *Reply) Dict() map[string][]byte {
-	if len(r.Data) < 1 {
-		return map[string][]byte{}
-	}
-	dict := make(map[string][]byte, len(r.Data)/2)
-	for i := 0; i < (len(r.Data) - 1); i += 2 {
-		dict[B2s(r.Data[i])] = r.Data[i+1]
-	}
-	return dict
-}
-
-func (r *Reply) KvLen() int {
-	return len(r.Data) / 2
-}
-
-func (r *Reply) KvEach(fn func(key, value BS)) int {
-	for i := 0; i < (len(r.Data) - 1); i += 2 {
-		fn(r.Data[i], r.Data[i+1])
-	}
-	return r.KvLen()
-}
-
-// JSON parses the JSON-encoded Reply Entry value and stores the result
-// in the value pointed to by v.
-func (r *Reply) JSON(v interface{}) error {
-	if r == nil || len(r.Data) == 0 {
-		return errors.New("empty reply")
-	}
-	if v == nil {
-		return errors.New("nil json destination")
-	}
-	return json.Unmarshal(r.Data[0], v)
-}
-
-// -----------
-// BS 辅助函数
-// -----------
-
-func (b BS) Bytes() []byte {
-	return b
-}
-
-func (b BS) String() string {
-	return B2s(b)
-}
-
-// Int is a convenience wrapper over Get for int value of a hashmap.
-func (b BS) Int() int {
-	return int(b.Uint64())
-}
-
-// Int64 is a convenience wrapper over Get for int64 value of a hashmap.
-func (b BS) Int64() int64 {
-	return int64(b.Uint64())
-}
-
-// Uint is a convenience wrapper over Get for uint value of a hashmap.
-func (b BS) Uint() uint {
-	return uint(b.Uint64())
-}
-
-// Uint64 is a convenience wrapper over Get for uint64 value of a hashmap.
-func (b BS) Uint64() uint64 {
-	if len(b) < uint64EncodedLen {
-		return 0
-	}
-	return binary.BigEndian.Uint64(b)
-}
-
-// JSON parses the JSON-encoded Reply Entry value and stores the result
-// in the value pointed to by v.
-func (b BS) JSON(v interface{}) error {
-	if v == nil {
-		return errors.New("nil json destination")
-	}
-	return json.Unmarshal(b, v)
 }
 
 // -----------------------
 // 辅助函数
 // -----------------------
 
-// EncodeHashKey 编码 Hash 数据 Key: [NameLen (1B)][Name][Key]
-func EncodeHashKey(name string, key []byte) ([]byte, error) {
+func encodeHashKeyToBuf(name string, key []byte, buf []byte) ([]byte, error) {
 	if len(name) > 255 {
 		return nil, ErrNameTooLong
 	}
 	if len(key) > 255 {
 		return nil, ErrKeyTooLong
 	}
-
-	buf := make([]byte, 1+len(name)+len(key))
+	reqLen := 1 + len(name) + len(key)
+	if len(buf) < reqLen {
+		buf = make([]byte, reqLen)
+	}
 	buf[0] = byte(len(name))
 	copy(buf[1:], name)
 	copy(buf[1+len(name):], key)
-	return buf, nil
+	return buf[:reqLen], nil
 }
 
-// DecodeHashKey 解码 Hash 数据 Key
+func EncodeHashKey(name string, key []byte) ([]byte, error) {
+	return encodeHashKeyToBuf(name, key, nil)
+}
+
 func DecodeHashKey(buf []byte) (name string, key []byte, err error) {
-	// 1. 至少需要 1 字节读取 NameLen
 	if len(buf) < 1 {
 		return "", nil, ErrBufferTooShort
 	}
-
-	// 2. 解析 Name 长度
 	nameLen := int(buf[0])
-
-	// 3. 校验 Buffer 长度是否足够容纳 Name
 	if len(buf) < 1+nameLen {
 		return "", nil, ErrBufferTooShort
 	}
-
-	// 4. 提取 Name 和 Key
 	name = string(buf[1 : 1+nameLen])
 	key = buf[1+nameLen:]
-
-	// 5. 校验提取出的 Key 是否符合约定（防止传入非法损坏的数据）
 	if len(key) > 255 {
 		return "", nil, ErrKeyTooLong
 	}
-
 	return name, key, nil
 }
 
-// EncodeZsetScoreKey 编码 Zet 数据 Key: [NameLen (1B)][Name][EncodedScore (8B)][Key]
-func EncodeZsetScoreKey(name string, key []byte, score uint64) ([]byte, error) {
+func encodeZsetScoreKeyToBuf(name string, key []byte, score uint64, buf []byte) ([]byte, error) {
 	if len(name) > 255 {
 		return nil, ErrNameTooLong
 	}
 	if len(key) > 255 {
 		return nil, ErrKeyTooLong
 	}
-
-	buf := make([]byte, 1+len(name)+uint64EncodedLen+len(key))
+	reqLen := 1 + len(name) + uint64EncodedLen + len(key)
+	if len(buf) < reqLen {
+		buf = make([]byte, reqLen)
+	}
 	buf[0] = byte(len(name))
 	copy(buf[1:], name)
-
-	// 优化：直接在 buf 上进行 BigEndian 编码，省去 I2b 的内存分配和 copy
 	binary.BigEndian.PutUint64(buf[1+len(name):], score)
-
 	copy(buf[1+len(name)+uint64EncodedLen:], key)
-	return buf, nil
+	return buf[:reqLen], nil
 }
 
-// DecodeZsetScoreKey 解码 Zet 数据 Key
+func EncodeZsetScoreKey(name string, key []byte, score uint64) ([]byte, error) {
+	return encodeZsetScoreKeyToBuf(name, key, score, nil)
+}
+
 func DecodeZsetScoreKey(buf []byte) (name string, key []byte, score uint64, err error) {
-	// 基础长度校验：至少需要 1B(NameLen) + 8B(Score) = 9 字节
 	if len(buf) < 1+uint64EncodedLen {
 		return "", nil, 0, ErrInvalidBuf
 	}
-
 	nameLen := int(buf[0])
-
-	// 严格长度校验：buffer 总长度必须 >= 1 + nameLen + 8
 	if len(buf) < 1+nameLen+uint64EncodedLen {
 		return "", nil, 0, ErrInvalidBuf
 	}
-
 	name = string(buf[1 : 1+nameLen])
-
-	// 读取 Score
 	scoreIndex := 1 + nameLen
 	score = binary.BigEndian.Uint64(buf[scoreIndex : scoreIndex+uint64EncodedLen])
-
-	// 读取 Key
 	keyIndex := scoreIndex + uint64EncodedLen
-	// 拷贝 key 以防止与原 buf 共享底层数组，避免潜在的内存泄漏
 	key = make([]byte, len(buf)-keyIndex)
 	copy(key, buf[keyIndex:])
-
 	return name, key, score, nil
 }
 
-// B2s converts byte slice to a string without memory allocation (Go 1.20+ safe).
 func B2s(b []byte) string {
 	if len(b) == 0 {
 		return ""
@@ -1341,44 +1099,12 @@ func B2s(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
-// S2b converts string to a byte slice without memory allocation (Go 1.20+ safe).
-func S2b(s string) []byte {
-	if len(s) == 0 {
-		return nil
-	}
-	return unsafe.Slice(unsafe.StringData(s), len(s))
-}
-
-// DS2b returns an 8-byte big endian representation of Digit string
-// v ("123456") -> uint64(123456) -> 8-byte big endian.
-func DS2b(v string) []byte {
-	i, err := strconv.ParseUint(v, 10, 64)
-	if err != nil {
-		return []byte("")
-	}
-	return I2b(i)
-}
-
-// DS2i returns uint64 of Digit string
-// v ("123456") -> uint64(123456).
-func DS2i(v string) uint64 {
-	i, err := strconv.ParseUint(v, 10, 64)
-	if err != nil {
-		return uint64(0)
-	}
-	return i
-}
-
-// I2b returns an 8-byte big endian representation of v
-// v uint64(123456) -> 8-byte big endian.
 func I2b(v uint64) []byte {
 	b := make([]byte, uint64EncodedLen)
 	binary.BigEndian.PutUint64(b, v)
 	return b
 }
 
-// B2i return an int64 of v
-// v (8-byte big endian) -> uint64(123456).
 func B2i(v []byte) uint64 {
 	if len(v) < uint64EncodedLen {
 		return 0
@@ -1386,8 +1112,41 @@ func B2i(v []byte) uint64 {
 	return binary.BigEndian.Uint64(v)
 }
 
-// B2ds return a Digit string of v
-// v (8-byte big endian) -> uint64(123456) -> "123456".
-func B2ds(v []byte) string {
-	return strconv.FormatUint(binary.BigEndian.Uint64(v), 10)
+func parseUintBytes(b []byte) (uint64, error) {
+	if len(b) == 0 {
+		return 0, errors.New("empty bytes")
+	}
+	var n uint64
+	for _, ch := range b {
+		if ch < '0' || ch > '9' {
+			return 0, errors.New("invalid char")
+		}
+		n = n*10 + uint64(ch-'0')
+	}
+	return n, nil
+}
+
+func parseIntBytes(b []byte) (int64, error) {
+	if len(b) == 0 {
+		return 0, errors.New("empty bytes")
+	}
+	neg := false
+	if b[0] == '-' {
+		neg = true
+		b = b[1:]
+	}
+	if len(b) == 0 {
+		return 0, errors.New("empty bytes")
+	}
+	var n int64
+	for _, ch := range b {
+		if ch < '0' || ch > '9' {
+			return 0, errors.New("invalid char")
+		}
+		n = n*10 + int64(ch-'0')
+	}
+	if neg {
+		return -n, nil
+	}
+	return n, nil
 }
