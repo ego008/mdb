@@ -1,11 +1,14 @@
 package mdb
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -762,6 +765,60 @@ func (d *DB) Compact(dstPath string) error {
 	return nil
 }
 
+// CompactZip 执行在线压缩并将结果打包为 ZIP 文件。
+//
+// - dstPath: 压缩后的中间 bbolt 数据库文件路径。如果传入空字符串，将自动创建临时文件并在打包完成后删除。
+// - zipPath: 最终生成的 .zip 文件路径。
+func (d *DB) CompactZip(dstPath, zipPath string) error {
+	if d == nil {
+		return errors.New("nil database")
+	}
+
+	d.mu.RLock()
+	if d.db == nil {
+		d.mu.RUnlock()
+		return errors.New("nil database")
+	}
+	origPath := d.db.Path()
+	d.mu.RUnlock()
+
+	// 判断是否需要创建临时文件
+	targetPath := dstPath
+	isTemp := false
+	if targetPath == "" {
+		targetPath = origPath + ".compact.tmp"
+		isTemp = true
+	}
+
+	// 1. 在读锁保护下执行原生的 compactDB
+	d.mu.RLock()
+	err := compactDB(d.db, targetPath, 0o600)
+	d.mu.RUnlock()
+
+	if err != nil {
+		if isTemp {
+			_ = os.Remove(targetPath)
+		}
+		return err
+	}
+
+	// 2. 将压缩后的 db 文件打包为 zip
+	err = createZipArchive(targetPath, zipPath)
+
+	// 3. 清理临时文件（若指定了 dstPath 则保留该中间文件）
+	if isTemp {
+		_ = os.Remove(targetPath)
+	}
+
+	// 如果打包失败，清理掉生成的损坏 zip 文件
+	if err != nil {
+		_ = os.Remove(zipPath)
+		return err
+	}
+
+	return nil
+}
+
 func compactDB(srcDB *bolt.DB, dstPath string, mode os.FileMode) error {
 	dstDB, err := bolt.Open(dstPath, mode, &bolt.Options{
 		Timeout: 5 * time.Second,
@@ -1021,4 +1078,57 @@ func keyUpperBoundToBuf(b []byte, bufPtr *[]byte) []byte {
 		}
 	}
 	return nil
+}
+
+// createZipArchive 辅助函数：将指定的源文件打包成 zip 格式
+func createZipArchive(sourcePath, zipPath string) (err error) {
+	// 创建 zip 输出文件
+	outFile, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	// 确保发生错误时文件描述符能被正确关闭
+	defer func() {
+		if cerr := outFile.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	zipWriter := zip.NewWriter(outFile)
+	defer func() {
+		if cerr := zipWriter.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	// 打开要打包的源文件
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	// 获取文件信息，用于生成 zip 文件头
+	info, err := sourceFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	header, err := zip.FileInfoHeader(info)
+	if err != nil {
+		return err
+	}
+	// 将文件内部名称设定为其自身的名字，去除绝对路径
+	header.Name = filepath.Base(sourcePath)
+	// 指定使用 Deflate 压缩算法
+	header.Method = zip.Deflate
+
+	writer, err := zipWriter.CreateHeader(header)
+	if err != nil {
+		return err
+	}
+
+	// 将源文件内容拷贝到 zip 写入器中
+	_, err = io.Copy(writer, sourceFile)
+	return err
 }
