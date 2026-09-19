@@ -171,6 +171,13 @@ func TestDB_Hash_Operations(t *testing.T) {
 			t.Errorf("HGetFunc failed: got %s, err %v", price, err)
 		}
 
+		if db.HKeyExist(tx, hashName, []byte("09:30:01")) != false {
+			t.Errorf("HKeyExist failed, expected false")
+		}
+		if db.HKeyExist(tx, hashName, []byte("09:30:00")) != true {
+			t.Errorf("HKeyExist failed, expected true")
+		}
+
 		err = db.HGetFunc(tx, hashName, []byte("09:30:01"), func(v []byte) error { return nil })
 		if !errors.Is(err, ErrKeyNotFound) {
 			t.Errorf("HGetFunc expected ErrKeyNotFound")

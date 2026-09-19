@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -173,6 +174,27 @@ func (d *DB) HIncr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, er
 	}
 	newVal := uint64(int64(current) + step)
 	return newVal, b.Put(reallyKey, I2b(newVal))
+}
+
+// HKeyExist 判断 Hash 中是否存在指定的 key
+func (d *DB) HKeyExist(tx *bolt.Tx, name string, key []byte) bool {
+	b := tx.Bucket(bucketHash)
+	if b == nil {
+		return false
+	}
+
+	// 从对象池获取 buffer，减少内存分配
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	// 编码真实的存储键
+	reallyKey, err := encodeHashKeyToBuf(name, key, bufPtr)
+	if err != nil {
+		return false // 编码失败（如 name 或 key 超长）则视为不存在
+	}
+
+	// 在 bbolt 中，如果键不存在，Get() 将返回 nil
+	return b.Get(reallyKey) != nil
 }
 
 func (d *DB) HGetFunc(tx *bolt.Tx, name string, key []byte, fn func(val []byte) error) error {
@@ -877,6 +899,22 @@ func compactDB(srcDB *bolt.DB, dstPath string, mode os.FileMode) error {
 // -----------------------
 // 辅助函数
 // -----------------------
+
+// B2s converts byte slice to a string without memory allocation (Go 1.20+ safe).
+func B2s(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// S2b converts string to a byte slice without memory allocation (Go 1.20+ safe).
+func S2b(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
 
 func Float64ToSortableUint64(f float64) uint64 {
 	u := math.Float64bits(f)
