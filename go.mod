@@ -1,4 +1,4 @@
-module mdb
+module github.com/ego008/mdb
 
 go 1.26.2
 
