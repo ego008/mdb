@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -195,6 +196,26 @@ func (d *DB) HKeyExist(tx *bolt.Tx, name string, key []byte) bool {
 
 	// 在 bbolt 中，如果键不存在，Get() 将返回 nil
 	return b.Get(reallyKey) != nil
+}
+
+func (d *DB) HGet(tx *bolt.Tx, name string, key []byte) []byte {
+	b := tx.Bucket(bucketHash)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	reallyKey, _ := encodeHashKeyToBuf(name, key, bufPtr)
+	return b.Get(reallyKey)
+}
+
+func (d *DB) HGetInt(tx *bolt.Tx, name string, key []byte) uint64 {
+	b := tx.Bucket(bucketHash)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	reallyKey, _ := encodeHashKeyToBuf(name, key, bufPtr)
+	v := b.Get(reallyKey)
+	if v == nil {
+		return 0 // 不存在返回 0
+	}
+	return B2i(v)
 }
 
 func (d *DB) HGetFunc(tx *bolt.Tx, name string, key []byte, fn func(val []byte) error) error {
@@ -419,6 +440,22 @@ func (d *DB) ZIncr(tx *bolt.Tx, name string, key []byte, step int64) (uint64, er
 	}
 	newScore := uint64(int64(current) + step)
 	return newScore, d.ZSet(tx, name, key, newScore)
+}
+
+func (d *DB) ZGetInt(tx *bolt.Tx, name string, key []byte) uint64 {
+	b := tx.Bucket(bucketZetMember)
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+	reallyKey, _ := encodeHashKeyToBuf(name, key, bufPtr)
+	v := b.Get(reallyKey)
+	if v == nil {
+		return 0
+	}
+	score := B2i(v)
+	if len(v) != uint64EncodedLen {
+		score, _ = parseUintBytes(v)
+	}
+	return score
 }
 
 func (d *DB) ZGetFunc(tx *bolt.Tx, name string, key []byte, fn func(score uint64) error) error {
@@ -1038,6 +1075,26 @@ func B2i(v []byte) uint64 {
 	return binary.BigEndian.Uint64(v)
 }
 
+// DS2b returns an 8-byte big endian representation of Digit string
+// v ("123456") -> uint64(123456) -> 8-byte big endian.
+func DS2b(v string) []byte {
+	i, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return []byte("")
+	}
+	return I2b(i)
+}
+
+// DS2i returns uint64 of Digit string
+// v ("123456") -> uint64(123456).
+func DS2i(v string) uint64 {
+	i, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return uint64(0)
+	}
+	return i
+}
+
 func parseUintBytes(b []byte) (uint64, error) {
 	if len(b) == 0 {
 		return 0, errors.New("empty bytes")
@@ -1075,6 +1132,18 @@ func parseIntBytes(b []byte) (int64, error) {
 		return -n, nil
 	}
 	return n, nil
+}
+
+func BConcat(slices ...[]byte) []byte {
+	var totalLen int
+	for _, s := range slices {
+		totalLen += len(s)
+	}
+	tmp := make([]byte, 0, totalLen)
+	for _, s := range slices {
+		tmp = append(tmp, s...)
+	}
+	return tmp
 }
 
 func keyUpperBound(b []byte) []byte {
