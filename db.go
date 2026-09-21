@@ -243,6 +243,28 @@ func (d *DB) HMGetFunc(tx *bolt.Tx, name string, keys [][]byte, fn func(key, val
 	return nil
 }
 
+func (d *DB) HScanExist(tx *bolt.Tx, name string, keyStart []byte, limit int) bool {
+	if limit <= 0 {
+		return false
+	}
+	b := tx.Bucket(bucketHash)
+	bufPtr1 := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr1)
+
+	reallyKeyStart, _ := encodeHashKeyToBuf(name, keyStart, bufPtr1)
+	prefixLen := 1 + len(name)
+	prefix := reallyKeyStart[:prefixLen] // Zero alloc prefix extraction
+
+	c := b.Cursor()
+	for k, _ := c.Seek(reallyKeyStart); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+		if len(keyStart) > 0 && bytes.Compare(k, reallyKeyStart) <= 0 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (d *DB) HScanFunc(tx *bolt.Tx, name string, keyStart []byte, limit int, fn func(key, val []byte) bool) error {
 	if limit <= 0 {
 		return nil
